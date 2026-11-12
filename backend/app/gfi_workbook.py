@@ -9,7 +9,7 @@ applied on top of the Excel values by the API.
 """
 
 import datetime
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 
 from openpyxl import load_workbook
@@ -27,12 +27,14 @@ class SourceCell:
     value: CellValue  # stored value (cached result for formulas)
     number_format: str  # Excel number format, e.g. "#,##0_);[Red](#,##0)"
     is_formula: bool
+    locked: bool = False  # not editable as a number regardless of content (e.g. company details in the database)
 
     @property
     def is_editable(self) -> bool:
         """Only plain numeric cells can be edited; formulas, text and empty cells cannot."""
         return (
-            not self.is_formula
+            not self.locked
+            and not self.is_formula
             and isinstance(self.value, (int, float))
             and not isinstance(self.value, bool)
         )
@@ -44,6 +46,8 @@ class SourceTable:
     sheet: str
     headers: dict[str, str | None]  # column letter -> original header
     rows: dict[int, dict[str, SourceCell]]  # Excel row number -> column letter -> cell
+    # Column letter -> GFI field (name, pib, kom, ...), found by header; set by app.gfi_store.
+    fields: dict[str, str] = field(default_factory=dict)
 
 
 def _to_json_value(value: object) -> CellValue:
@@ -89,6 +93,45 @@ def read_source_table(path: Path) -> SourceTable:
     finally:
         values_wb.close()
         formulas_wb.close()
+
+
+RB_HEADER = "R.B."
+
+
+def _is_rb(header: str | None) -> bool:
+    return header is not None and header.strip().upper() == RB_HEADER
+
+
+def main_list_rows(table: SourceTable) -> list[int]:
+    """Excel rows of the company list: from the top while R.B. (first "R.B." column)
+    continues the sequence 1, 2, 3, ... (2025: 165 companies, ending with DAGOTTA).
+    Empty if there is no such sequence."""
+    rb_col = next((k for k, h in table.headers.items() if _is_rb(h)), None)
+    rows: list[int] = []
+    if rb_col is None:
+        return rows
+    for row_number, cells in table.rows.items():
+        value = cells[rb_col].value
+        if isinstance(value, bool) or value != len(rows) + 1:
+            break
+        rows.append(row_number)
+    return rows
+
+
+def company_list(table: SourceTable) -> SourceTable:
+    """The company list as the app uses it: only the main_list_rows (all rows if the
+    workbook has no R.B. sequence), without the R.B. columns. R.B. is used only here, to
+    find the list; it is not shown, returned by the API or stored. The app numbers the
+    companies itself ("#" = position in the list)."""
+    rows = main_list_rows(table) or list(table.rows)
+    keep = [key for key, header in table.headers.items() if not _is_rb(header)]
+    return SourceTable(
+        workbook=table.workbook,
+        sheet=table.sheet,
+        headers={key: table.headers[key] for key in keep},
+        rows={row: {key: table.rows[row][key] for key in keep} for row in rows},
+        fields=table.fields,
+    )
 
 
 _cache: dict[Path, tuple[float, SourceTable]] = {}

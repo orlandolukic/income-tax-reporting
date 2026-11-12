@@ -1,4 +1,4 @@
-import { createContext, useContext, useEffect, useState, type ReactNode } from "react";
+import { createContext, useCallback, useContext, useEffect, useState, type ReactNode } from "react";
 import { getLogger } from "@/logger";
 
 const logger = getLogger("reportingYear");
@@ -12,6 +12,8 @@ type ReportingYearState = {
   setSelectedYear: (year: number) => void;
   loading: boolean;
   error: string | null;
+  /** Loads the list of years again (e.g. after a year was constructed on the Migracija page). */
+  reloadYears: () => void;
 };
 
 const ReportingYearContext = createContext<ReportingYearState | null>(null);
@@ -38,6 +40,7 @@ export function ReportingYearProvider({ children }: { children: ReactNode }) {
   const [selectedYear, setSelectedYearState] = useState<number | null>(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
+  const [reloadKey, setReloadKey] = useState(0);
 
   useEffect(() => {
     fetch("/api/reporting-years")
@@ -57,7 +60,9 @@ export function ReportingYearProvider({ children }: { children: ReactNode }) {
         setError("Unable to load reporting years.");
       })
       .finally(() => setLoading(false));
-  }, []);
+  }, [reloadKey]);
+
+  const reloadYears = useCallback(() => setReloadKey((k) => k + 1), []);
 
   function setSelectedYear(year: number) {
     try {
@@ -70,7 +75,7 @@ export function ReportingYearProvider({ children }: { children: ReactNode }) {
   }
 
   return (
-    <ReportingYearContext.Provider value={{ years, selectedYear, setSelectedYear, loading, error }}>
+    <ReportingYearContext.Provider value={{ years, selectedYear, setSelectedYear, loading, error, reloadYears }}>
       {children}
     </ReportingYearContext.Provider>
   );

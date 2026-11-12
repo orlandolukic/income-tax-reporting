@@ -29,7 +29,7 @@ export function AppSidebar() {
                   <Workflow className="size-4" />
                 </div>
                 <div className="grid flex-1 text-start text-sm leading-tight">
-                  <span className="truncate font-semibold">tim-automation</span>
+                  <span className="truncate font-semibold">Income Tax Reporting</span>
                   <span className="truncate text-xs">Admin</span>
                 </div>
               </Link>

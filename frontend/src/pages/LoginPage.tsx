@@ -48,7 +48,7 @@ export default function LoginPage() {
           <div className="bg-primary text-primary-foreground flex size-8 items-center justify-center rounded-lg">
             <Workflow className="size-4" />
           </div>
-          <span className="text-xl font-semibold">tim-automation</span>
+          <span className="text-xl font-semibold">Income Tax Reporting</span>
         </div>
         <Card className="gap-4">
           <CardHeader>

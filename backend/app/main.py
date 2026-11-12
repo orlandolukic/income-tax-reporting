@@ -1,15 +1,22 @@
 from contextlib import asynccontextmanager
 
-from fastapi import FastAPI
-from fastapi.middleware.cors import CORSMiddleware
-from fastapi.middleware.gzip import GZipMiddleware
+from app.settings import load_settings
 
-from app.auth import router as auth_router
-from app.companies import router as companies_router
-from app.edits_store import init_db
-from app.logging_config import get_logger, setup_logging
-from app.pb1 import router as pb1_router
-from app.reporting_years import router as reporting_years_router
+# Load backend/.env before anything reads the environment (LOG_LEVEL, DATABASE_URL, ...).
+load_settings()
+
+from fastapi import FastAPI  # noqa: E402
+from fastapi.middleware.cors import CORSMiddleware  # noqa: E402
+from fastapi.middleware.gzip import GZipMiddleware  # noqa: E402
+
+from app.auth import router as auth_router  # noqa: E402
+from app.companies import router as companies_router  # noqa: E402
+from app.db import database_enabled, describe_database  # noqa: E402
+from app.edits_store import init_db  # noqa: E402
+from app.logging_config import get_logger, setup_logging  # noqa: E402
+from app.pb1 import router as pb1_router  # noqa: E402
+from app.migration import router as migration_router
+from app.reporting_years import router as reporting_years_router  # noqa: E402
 
 setup_logging()
 logger = get_logger(__name__)
@@ -17,13 +24,18 @@ logger = get_logger(__name__)
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    init_db()
+    if database_enabled():
+        logger.info("GFI data source: PostgreSQL (%s)", describe_database())
+    else:
+        # No database configured: GFI from the Excel workbooks, edits in SQLite.
+        init_db()
+        logger.info("GFI data source: Excel workbooks + SQLite edits (DATABASE_URL not set)")
     logger.info("Backend started")
     yield
     logger.info("Backend stopped")
 
 
-app = FastAPI(title="tim-automation", lifespan=lifespan)
+app = FastAPI(title="Income Tax Reporting", lifespan=lifespan)
 
 app.add_middleware(
     CORSMiddleware,
@@ -39,6 +51,7 @@ app.include_router(auth_router)
 app.include_router(reporting_years_router)
 app.include_router(companies_router)
 app.include_router(pb1_router)
+app.include_router(migration_router)
 
 
 @app.get("/api/health")

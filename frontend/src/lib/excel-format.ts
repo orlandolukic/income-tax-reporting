@@ -109,6 +109,43 @@ function renderSection(value: number, section: string): string {
   return out;
 }
 
+/**
+ * The same Excel format with exactly `decimals` decimal places in every numeric section
+ * ("#,##0_ ;[Red]\-#,##0\ " -> "#,##0.00_ ;[Red]\-#,##0.00\ ", "0.00%" stays). Signs,
+ * colors, parentheses and literals are kept. "General", "@" or no format -> "#,##0.00".
+ */
+export function withDecimals(format: string | null | undefined, decimals: number): string {
+  const fraction = decimals > 0 ? `.${"0".repeat(decimals)}` : "";
+  if (!format || format === "General" || format === "@") return `#,##0${fraction}`;
+  return splitSections(format)
+    .map((section) => {
+      let out = "";
+      for (let i = 0; i < section.length; i++) {
+        const ch = section[i];
+        if (ch === "\\" || ch === "_" || ch === "*") {
+          out += ch + (section[i + 1] ?? "");
+          i++;
+        } else if (ch === '"' || ch === "[") {
+          const end = section.indexOf(ch === '"' ? '"' : "]", i + 1);
+          const stop = end === -1 ? section.length : end + 1;
+          out += section.slice(i, stop);
+          i = stop - 1;
+        } else if (NUMBER_PLACEHOLDERS.test(ch)) {
+          let j = i;
+          while (j < section.length && NUMBER_PLACEHOLDERS.test(section[j])) j++;
+          // Keep the integer part (with its thousands separator), replace the decimals.
+          const integer = section.slice(i, j).split(".")[0] || "0";
+          out += integer + fraction;
+          i = j - 1;
+        } else {
+          out += ch;
+        }
+      }
+      return out;
+    })
+    .join(";");
+}
+
 export function formatNumber(value: number, format: string | null | undefined): FormattedNumber {
   if (!format || format === "General" || format === "@") {
     return { text: formatGeneral(value), red: false };

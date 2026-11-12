@@ -10,19 +10,34 @@ export type CompanyCell = {
   format?: string; // Excel number format; missing = "General"
   formula?: boolean;
   editable?: boolean;
+  text?: boolean; // company detail edited as text (Company Registry); read-only on Home
   edited?: boolean;
   original?: CellValue; // Excel value of an edited cell
 };
 export type CompanyColumn = { key: string; header: string | null };
 export type CompanyRow = { row: number; cells: Record<string, CompanyCell> };
+export type ColumnTotal = {
+  key: string;
+  header: string | null;
+  total: number;
+  share?: number; // total / kom total; missing when the kom total is 0
+};
+/** Totals under the Home table, computed by the server. */
+export type TableStats = {
+  base_key: string;
+  base_header: string | null;
+  base_total: number;
+  columns: ColumnTotal[];
+};
 export type CompanyTableData = {
   workbook: string;
   sheet: string;
   columns: CompanyColumn[];
   rows: CompanyRow[];
+  stats?: TableStats;
 };
 
-export type PendingValue = { row: number; column: string; value: number | null };
+export type PendingValue = { row: number; column: string; value: number | string | null };
 
 type Options = {
   /** Changes not yet saved on the server, applied on top of freshly loaded data. */
@@ -77,9 +92,13 @@ export function useCompanyTable(year: number | null, options: Options) {
     setData((prev) => prev && patchCell(prev, row, column, patch));
   }, []);
 
+  const setStats = useCallback((stats: TableStats) => {
+    setData((prev) => prev && { ...prev, stats });
+  }, []);
+
   const reload = useCallback(() => setReloadKey((k) => k + 1), []);
 
-  return { data, loading, error, setCell, reload };
+  return { data, loading, error, setCell, setStats, reload };
 }
 
 function patchCell(

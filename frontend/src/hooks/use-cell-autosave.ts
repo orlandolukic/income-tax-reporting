@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useRef, useState } from "react";
-import type { PendingValue } from "@/hooks/use-company-table";
+import type { PendingValue, TableStats } from "@/hooks/use-company-table";
 import { getLogger } from "@/logger";
 
 const logger = getLogger("autosave");
@@ -9,8 +9,24 @@ const logger = getLogger("autosave");
 const STORAGE_KEY = "pending-cell-edits";
 const RETRY_DELAY_MS = 10_000;
 
-export type PendingEdit = PendingValue & { year: number };
-export type SaveResult = { row: number; column: string; value: number | null; edited: boolean };
+/** A PB-1 form field: amount of one company, or a template field shared by every company. */
+export type Pb1Target = { company: number; tab: string; shared: boolean };
+/** A GFI cell edit, or (with `pb1`) a PB-1 field edit; `row` is the Excel row. */
+export type PendingEdit = PendingValue & { year: number; pb1?: Pb1Target };
+export type SaveResult = {
+  row: number;
+  column: string;
+  value: number | string | null;
+  edited: boolean;
+  /** Recomputed formula columns of the same row (GFI ZA RAD, PB-1,PB-2 za rad). */
+  formulas?: Record<string, number | string | null>;
+  /** Recomputed table statistics (totals under the Home table). */
+  stats?: TableStats;
+  /** PB-1: the tab's computed cells (workbook formulas) after the change. */
+  computed?: { row: number; column: string; value: number | null }[];
+  /** PB-1: tax loss after the change (the Poreski bilans tax base is negative). */
+  loss?: { base: number } | null;
+};
 export type SaveState =
   | { state: "idle" }
   | { state: "saving" }
@@ -24,7 +40,15 @@ type Callbacks = {
   onUnauthorized: () => void;
 };
 
-const keyOf = (e: PendingEdit) => `${e.year}:${e.column}${e.row}`;
+const keyOf = (e: PendingEdit) =>
+  e.pb1
+    ? `${e.year}:pb1:${e.pb1.tab}:${e.pb1.shared ? "all" : e.pb1.company}:${e.column}${e.row}`
+    : `${e.year}:${e.column}${e.row}`;
+
+const urlOf = (e: PendingEdit) =>
+  e.pb1
+    ? `/api/reporting-years/${e.year}/companies/${e.pb1.company}/pb1/${e.pb1.tab}/cells/${e.column}/${e.row}`
+    : `/api/reporting-years/${e.year}/cells/${e.column}/${e.row}`;
 
 function loadQueue(): PendingEdit[] {
   try {
@@ -44,7 +68,11 @@ function storeQueue(queue: PendingEdit[]) {
   }
 }
 
-/** Sends cell edits to the server one at a time, in order, with retry. */
+/**
+ * Sends cell edits to the server one at a time, in order, with retry.
+ * Use it through CellAutosaveProvider: one queue for the whole app, so pages never
+ * send or store the queue concurrently.
+ */
 export function useCellAutosave(callbacks: Callbacks) {
   const queueRef = useRef<PendingEdit[]>(loadQueue());
   const busyRef = useRef(false);
@@ -76,7 +104,7 @@ export function useCellAutosave(callbacks: Callbacks) {
         setStatus({ state: "saving" });
         let res: Response;
         try {
-          res = await fetch(`/api/reporting-years/${edit.year}/cells/${edit.column}/${edit.row}`, {
+          res = await fetch(urlOf(edit), {
             method: "PUT",
             headers: { "Content-Type": "application/json" },
             body: JSON.stringify({ value: edit.value }),
@@ -132,8 +160,36 @@ export function useCellAutosave(callbacks: Callbacks) {
 
   const retry = useCallback(() => void process(), [process]);
 
+  /**
+   * Sends every unsaved change now and waits until the queue is empty. Resolves true when all
+   * changes are saved, false when some are still unsaved (offline, server error, session expired).
+   */
+  const flush = useCallback(async (): Promise<boolean> => {
+    // Let an editor that is closing (blur) put its change in the queue first.
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    for (let attempt = 0; attempt < 600; attempt++) {
+      if (queueRef.current.length === 0 && !busyRef.current) return true;
+      if (!busyRef.current) {
+        await process();
+        return queueRef.current.length === 0;
+      }
+      await new Promise((resolve) => setTimeout(resolve, 50)); // a save is in progress
+    }
+    return queueRef.current.length === 0;
+  }, [process]);
+
+  // GFI cell edits of a year (PB-1 edits have their own list below).
   const pendingFor = useCallback(
-    (year: number) => queueRef.current.filter((e) => e.year === year),
+    (year: number) => queueRef.current.filter((e) => e.year === year && !e.pb1),
+    [],
+  );
+
+  // PB-1 edits shown on one company's form tab: its amounts and the shared template fields.
+  const pendingPb1 = useCallback(
+    (year: number, company: number, tab: string) =>
+      queueRef.current.filter(
+        (e) => e.year === year && e.pb1?.tab === tab && (e.pb1.shared || e.pb1.company === company),
+      ),
     [],
   );
 
@@ -146,5 +202,5 @@ export function useCellAutosave(callbacks: Callbacks) {
     return () => window.clearTimeout(retryTimerRef.current);
   }, [process]);
 
-  return { status, pendingCount, enqueue, retry, pendingFor };
+  return { status, pendingCount, enqueue, retry, flush, pendingFor, pendingPb1 };
 }

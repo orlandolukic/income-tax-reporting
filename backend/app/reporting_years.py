@@ -67,10 +67,13 @@ def get_workbook_path(year: int) -> Path:
 
 @router.get("/reporting-years")
 def reporting_years(username: str = Depends(require_user)) -> ReportingYearsResponse:
-    data_dir = get_data_dir()
-    years = find_reporting_years(data_dir)
+    # Imported here: app.gfi_store imports this module.
+    from app.gfi_store import get_gfi_store
+
+    store = get_gfi_store()
+    years = store.years()
     if years:
-        logger.debug("Reporting years found in %s: %s", data_dir, years)
+        logger.debug("Reporting years (%s): %s", store.name, years)
     else:
-        logger.warning("No GFI workbooks found in %s", data_dir)
+        logger.warning("No GFI data found (%s)", store.name)
     return ReportingYearsResponse(years=years)

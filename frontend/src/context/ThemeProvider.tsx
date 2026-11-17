@@ -1,6 +1,7 @@
 import { createContext, useContext, useEffect, useState, type ReactNode } from "react";
 
-export type Theme = "light" | "dark" | "system";
+// Two themes only (user's rule, 2026-11-15): light and dark, chosen by the user and remembered.
+export type Theme = "light" | "dark";
 
 // Must match the key used by the inline script in index.html.
 const STORAGE_KEY = "ui-theme";
@@ -12,21 +13,19 @@ type ThemeState = {
 
 const ThemeContext = createContext<ThemeState | null>(null);
 
+/** The stored theme; without one (or an old "system"), the operating system's choice, once. */
 function readStoredTheme(): Theme {
   try {
     const value = localStorage.getItem(STORAGE_KEY);
-    if (value === "light" || value === "dark" || value === "system") return value;
+    if (value === "light" || value === "dark") return value;
   } catch {
-    // Storage unavailable (private mode, blocked): fall back to system.
+    // Storage unavailable (private mode, blocked): use the operating system's choice.
   }
-  return "system";
+  return window.matchMedia("(prefers-color-scheme: dark)").matches ? "dark" : "light";
 }
 
 function applyTheme(theme: Theme) {
-  const dark =
-    theme === "dark" ||
-    (theme === "system" && window.matchMedia("(prefers-color-scheme: dark)").matches);
-  document.documentElement.classList.toggle("dark", dark);
+  document.documentElement.classList.toggle("dark", theme === "dark");
 }
 
 export function ThemeProvider({ children }: { children: ReactNode }) {
@@ -34,11 +33,6 @@ export function ThemeProvider({ children }: { children: ReactNode }) {
 
   useEffect(() => {
     applyTheme(theme);
-    if (theme !== "system") return;
-    const media = window.matchMedia("(prefers-color-scheme: dark)");
-    const onChange = () => applyTheme("system");
-    media.addEventListener("change", onChange);
-    return () => media.removeEventListener("change", onChange);
   }, [theme]);
 
   function setTheme(next: Theme) {

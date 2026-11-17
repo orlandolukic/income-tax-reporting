@@ -13,22 +13,19 @@ The other columns are the template shared by every company. Helper columns (H..Q
 Poreski bilans, H..J in Preliminarni rezultat), the title rows and company names above the
 tables are not part of the form. The amounts belong to one company only (see app.pb1).
 
-The .xls file is read with xlrd and never written.
+The form is built from SheetCells: the sheets as stored in PostgreSQL (app.pb1_store), or, only
+in the one-time import, as read from the .xls file (app.pb1_file). No Excel library here.
 """
 
 import re
 import unicodedata
 from dataclasses import dataclass, field, replace
-from pathlib import Path
 
-import xlrd
 
 from app.logging_config import get_logger
 from app.pb1_texts import correct_text
 
 logger = get_logger(__name__)
-
-PB1_FILE_PATTERN = re.compile(r"^(\d{4}) PB-1\.xls$", re.IGNORECASE)
 
 # Legal-form words ignored when comparing company names.
 LEGAL_FORMS = {"DOO", "DOOEL", "AD", "OD", "PR", "SZR", "STR", "KD", "JP"}
@@ -94,6 +91,35 @@ class Pb1TabSpec:
     # Columns of the head table, aligned one to one with the table's columns (the comment
     # column's head cells take the place of the column after it). None: the table's columns.
     head_columns: tuple[str, ...] | None = None
+    # Head-row columns left out of the form (their cells are empty): the head table then ends
+    # with the last column that has content (user's decision).
+    head_dropped_columns: frozenset[str] = frozenset()
+    # Columns of the closing rows (summary) that are not part of the form: not shown, not
+    # stored (user, 2026-11-16: the box shows only description and amount).
+    summary_dropped_columns: frozenset[str] = frozenset()
+    # Section rows (bold description, e.g. "A. ...", "II ...", "B. ..."): only their line number
+    # and description; their other cells are not part of the form (user, 2026-11-16: read-only
+    # and empty). `section_hidden` lists cells that stay in the data (inputs of formulas, stored)
+    # but are not shown in their row (Pb1Cell.hidden).
+    section_rows_empty: bool = False
+    section_hidden: frozenset[tuple[int, str]] = frozenset()
+    # An extra head row below the last one (label, the address whose value it shows, the label's
+    # column, the value's column, the value's fill); the label with the fill of the label row
+    # above; read-only.
+    head_result: tuple[str, str, str, str, str] | None = None
+    # Every value-column cell of the form lines (not section / closing rows) is an amount field
+    # of the company: numbers only, shown with two decimals, 0,00 when empty (user, 2026-11-16).
+    form_values_are_amounts: bool = False
+    # Numbers are never bold (only texts keep the sheet's bold), user 2026-11-16.
+    plain_numbers: bool = False
+    # Single cells shown without the sheet's bold, as (row, column).
+    plain_cells: frozenset[tuple[int, str]] = frozenset()
+    # Single cells that are not part of the form (not shown, not stored), as (row, column).
+    dropped_cells: frozenset[tuple[int, str]] = frozenset()
+    # Column whose positive values are shown red (Poreski bilans: Prekoracenje, an overrun).
+    overrun_column: str | None = None
+    # Single read-only cells, as (row, column): e.g. value cells of a section heading row.
+    readonly_cells: frozenset[tuple[int, str]] = frozenset()
 
 
 PB1_TABS: tuple[Pb1TabSpec, ...] = (
@@ -108,6 +134,24 @@ PB1_TABS: tuple[Pb1TabSpec, ...] = (
         months_cell=(1, "D"),  # 12: months in business (Mesecna akontacija = porez / months)
         months_label="Meseci poslovanja",
         comment_column="F", head_columns=("A", "B", "C", "D", "E", "F"),
+        # E and F of rows 1-3 are not part of the form (user, 2026-11-15): E1 and its double F1
+        # were used by nothing; E3 / F3 were where Klasa 5 / Klasa 6 were typed in. Klasa 5 / 6
+        # (C3 / D3) are now amounts entered directly, per company. The head ends with Klasa 6.
+        head_dropped_columns=frozenset("EF"),
+        summary_dropped_columns=frozenset("ADEG"),
+        section_rows_empty=True,
+        form_values_are_amounts=True,
+        plain_numbers=True,
+        overrun_column="E",  # Prekoracenje = Ostvareni - Priznati; an overrun (> 0) is red
+        # The total lines 57, 59, 62 have no Prekoracenje; "V. Poreska osnovica" (row 85) is the
+        # heading of the closing rows, without a value (user, 2026-11-17; it was an amount field).
+        dropped_cells=frozenset({(70, "E"), (74, "E"), (77, "E"), (85, "C")}),
+        # C5 (A. Poslovna dobit i gubitak: the loss Klasa 6 - Klasa 5 when negative, an input of
+        # Oporeziva dobit C74) is not shown in its row; it is shown as a fourth head row, under
+        # Klasa 5 / Klasa 6 (user, 2026-11-16).
+        section_hidden=frozenset({(5, "C")}),
+        # The value in its own colour (user, 2026-11-16): light rose of the Excel palette.
+        head_result=("Gubitak (Klasa 6 - 5)", "C5", "C", "D", "#ffcccc"),
         # Form lines without an amount cell get the column their section uses:
         # I and V..B. Kapitalni dobici -> C (Priznati troskovi), III -> D (Ostvareni troskovi).
         amount_fixes=(
@@ -132,6 +176,10 @@ PB1_TABS: tuple[Pb1TabSpec, ...] = (
         key="uporedo", sheet_prefix="Uporedo", columns=("A", "B", "C", "D", "E"),
         value_columns=frozenset("CDE"), wrap_columns=frozenset("B"), header_marker="r.b.",
         narrow_columns=frozenset("A"),
+        # #, Opis and Index are read-only (user, 2026-11-17: the Index is computed).
+        readonly_columns=frozenset("BE"),
+        # <year> and <year-1>: every field of a line is a company amount (user, 2026-11-17).
+        form_values_are_amounts=True,
         # Every line has <year>, <year-1> and Index; the two unlabelled spacer rows have none.
         amount_fixes=(
             AmountFix(11, "Poreski gubitak", "CDE"),
@@ -147,7 +195,15 @@ PB1_TABS: tuple[Pb1TabSpec, ...] = (
         first_row=2, max_empty_rows=5, narrow_columns=frozenset("AE"),
         # Opis, and the right table's texts ("Uvecanje poreske osnovice po Poreskom bilansu", ...);
         # everything above Opis (the title) and its "R.b. | Opis | RSD" row.
-        readonly_columns=frozenset("BF"), readonly_top=(4, "ABC"),
+        # D: the empty spacer column between the two tables, not shown (user, 2026-11-17: only
+        # the numbers can change).
+        readonly_columns=frozenset("BDF"), readonly_top=(4, "ABC"),
+        # The value cells of the section headings (Uvecanje / Umanjenje poreske osnovice po
+        # Poreskom bilansu, Poreske olaksice; Podbilansi bilansa uspeha, Troskovi koji se ne
+        # priznaju ...): read-only like the headings (user, 2026-11-17).
+        readonly_cells=frozenset({(2, "G"), (12, "G"), (19, "G"), (34, "C"), (41, "C")}),
+        # The value right of "Prekoracenje reprezentacije" (=Poreski bilans E33): not bold (user).
+        plain_cells=frozenset({(3, "G")}),
         # Left table (A..C) like Uporedo: every line has RSD, the unlabelled spacer rows none.
         # The right table (E..G) keeps its amounts.
         amount_fixes=(
@@ -172,6 +228,10 @@ class Pb1Cell:
     amount: bool = False
     # Fill color of the cell in the sheet ("#rrggbb"), read for the head rows only.
     fill: str | None = None
+    # Not part of the form (Pb1Sheet.dropped): always empty and read-only, not stored.
+    dropped: bool = False
+    # Kept in the data (stored, an input of formulas) but not shown in its row: empty, read-only.
+    hidden: bool = False
 
 
 @dataclass(frozen=True)
@@ -183,6 +243,9 @@ class Pb1Sheet:
     rows: dict[int, dict[str, Pb1Cell]]  # Excel row number -> column -> cell (with amounts)
     summary_start: int | None = None  # first Excel row of the summary table (rows from it on)
     head_end: int = 0  # last Excel row of the head table above the form (0: none)
+    # Cells of the form's columns that are not part of the form (section rows, the closing rows'
+    # hidden columns): left out of `rows` and of the stored snapshot. (Excel row, column).
+    dropped: frozenset[tuple[int, str]] = frozenset()
 
 
 @dataclass(frozen=True)
@@ -207,41 +270,60 @@ def normalize_company_name(name: str) -> str:
     return " ".join(tokens[:cut])
 
 
-def find_pb1_workbook(data_dir: Path, year: int) -> Path | None:
-    if not data_dir.is_dir():
-        return None
-    matches = sorted(
-        p for p in data_dir.iterdir()
-        if not p.name.startswith("~$") and (m := PB1_FILE_PATTERN.match(p.name)) and int(m.group(1)) == year
-    )
-    if len(matches) > 1:
-        logger.warning("Multiple PB-1 workbooks for %s, using %s", year, matches[0].name)
-    return matches[0] if matches else None
+@dataclass(frozen=True)
+class RawCell:
+    """One cell of a PB-1 sheet as stored in the file (and in the database snapshot)."""
+
+    kind: str  # "empty" (formatting only), "text", "number", "bool" or "error"
+    value: CellValue  # None for "empty"; an error as its text ("#DIV/0!")
+    number_format: str = "General"
+    bold: bool = False
+    fill: str | None = None  # solid fill color ("#rrggbb"); None without a fill or for white
 
 
-def _cell_value(sheet: xlrd.sheet.Sheet, r: int, c: int) -> CellValue:
+EMPTY_CELL = RawCell("empty", None)
+CELL_KINDS = ("empty", "text", "number", "bool", "error")
+
+
+@dataclass(frozen=True)
+class SheetCells:
+    """A PB-1 sheet independent of where it was read from: the .xls file (xlrd) or the
+    PostgreSQL snapshot (app.pb1_store). Cells that are empty and unformatted are left out."""
+
+    name: str
+    nrows: int
+    ncols: int
+    cells: dict[tuple[int, int], RawCell]  # (0-based row, 0-based column) -> cell
+    widths: dict[int, int]  # column index -> width from the sheet (1/256 of a character)
+
+    def cell(self, r: int, c: int) -> RawCell:
+        return self.cells.get((r, c), EMPTY_CELL)
+
+
+def _cell_value(sheet: SheetCells, r: int, c: int) -> CellValue:
     if c >= sheet.ncols:
         return None
-    ctype, value = sheet.cell_type(r, c), sheet.cell_value(r, c)
-    if ctype in (xlrd.XL_CELL_EMPTY, xlrd.XL_CELL_BLANK):
-        return None
-    if ctype == xlrd.XL_CELL_NUMBER:
-        return int(value) if float(value).is_integer() else value
-    if ctype == xlrd.XL_CELL_BOOLEAN:
-        return bool(value)
-    if ctype == xlrd.XL_CELL_ERROR:
-        return xlrd.error_text_from_code.get(value, "#ERR")
-    return value  # text (dates do not occur in these sheets)
+    return sheet.cell(r, c).value
 
 
-def _is_amount_field(sheet: xlrd.sheet.Sheet, r: int, c: int) -> bool:
+def _is_amount_field(sheet: SheetCells, r: int, c: int) -> bool:
     """A number, an Excel error (e.g. #DIV/0!) or a blank text (" ") in the file."""
     if c >= sheet.ncols:
         return False
-    ctype = sheet.cell_type(r, c)
-    if ctype in (xlrd.XL_CELL_NUMBER, xlrd.XL_CELL_ERROR):
+    cell = sheet.cell(r, c)
+    if cell.kind in ("number", "error"):
         return True
-    return ctype == xlrd.XL_CELL_TEXT and not str(sheet.cell_value(r, c)).strip()
+    return cell.kind == "text" and not str(cell.value).strip()
+
+
+def _text(sheet: SheetCells, r: int, c: int) -> str:
+    """The cell's text like xlrd's cell_value: "" for an empty cell, "1.0" for a number."""
+    cell = sheet.cell(r, c) if c < sheet.ncols else EMPTY_CELL
+    if cell.kind == "text":
+        return str(cell.value)
+    if cell.kind == "number":
+        return str(float(cell.value))
+    return ""
 
 
 def _label_key(text: CellValue) -> str:
@@ -305,7 +387,7 @@ def _column_letter(index: int) -> str:
     return letters
 
 
-def _raw_values(sheet: xlrd.sheet.Sheet) -> dict[str, CellValue]:
+def _raw_values(sheet: SheetCells) -> dict[str, CellValue]:
     """Every non-empty cell of the sheet as stored in the file, keyed by its address ("C7")."""
     values: dict[str, CellValue] = {}
     for r in range(sheet.nrows):
@@ -320,18 +402,17 @@ def _column_index(key: str) -> int:
     return ord(key) - ord("A")
 
 
-def _read_sheet(book: xlrd.book.Book, sheet: xlrd.sheet.Sheet, spec: Pb1TabSpec) -> Pb1Sheet:
+def _read_sheet(sheet: SheetCells, spec: Pb1TabSpec) -> Pb1Sheet:
     def style(r: int, c: int) -> tuple[str, bool]:
         if c >= sheet.ncols:
             return "General", False
-        xf = book.xf_list[sheet.cell_xf_index(r, c)]
-        fmt = book.format_map.get(xf.format_key)
-        return (fmt.format_str if fmt else "General"), bool(book.font_list[xf.font_index].bold)
+        cell = sheet.cell(r, c)
+        return cell.number_format, cell.bold
 
     indexes = [_column_index(key) for key in spec.columns]
     if spec.header_marker is not None:
         header_index = next(
-            (r for r in range(sheet.nrows) if str(sheet.cell_value(r, 0)).strip().lower().startswith(spec.header_marker)),
+            (r for r in range(sheet.nrows) if _text(sheet, r, 0).strip().lower().startswith(spec.header_marker)),
             None,
         )
         if header_index is None:
@@ -351,17 +432,13 @@ def _read_sheet(book: xlrd.book.Book, sheet: xlrd.sheet.Sheet, spec: Pb1TabSpec)
             headers[key] = "#"
 
     widths = {
-        key: sheet.colinfo_map[c].width // 256 if c in sheet.colinfo_map else 10
+        key: sheet.widths[c] // 256 if c in sheet.widths else 10
         for key, c in zip(spec.columns, indexes)
     }
 
     def fill(r: int, c: int) -> str | None:
         """Solid fill color of a cell ("#rrggbb"), None without a fill or for white."""
-        if c >= sheet.ncols:
-            return None
-        background = book.xf_list[sheet.cell_xf_index(r, c)].background
-        rgb = book.colour_map.get(background.pattern_colour_index) if background.fill_pattern == 1 else None
-        return None if rgb is None or rgb == (255, 255, 255) else "#{:02x}{:02x}{:02x}".format(*rgb)
+        return sheet.cell(r, c).fill if c < sheet.ncols else None
 
     rows: dict[int, dict[str, Pb1Cell]] = {}
     # Head rows above the header (Poreski bilans: rows 1-3): every number is an amount, except
@@ -370,6 +447,9 @@ def _read_sheet(book: xlrd.book.Book, sheet: xlrd.sheet.Sheet, spec: Pb1TabSpec)
     for r in range(head_end):
         cells = {}
         for key, c in zip(spec.columns, indexes):
+            if key in spec.head_dropped_columns:
+                cells[key] = Pb1Cell(value=None, number_format="General", bold=False)
+                continue
             value = _cell_value(sheet, r, c)
             number_format, bold = style(r, c)
             is_number = isinstance(value, (int, float)) and not isinstance(value, bool)
@@ -410,6 +490,9 @@ def _read_sheet(book: xlrd.book.Book, sheet: xlrd.sheet.Sheet, spec: Pb1TabSpec)
         rows[r + 1] = cells
     _apply_amount_fixes(sheet.name, spec, rows)
     summary_start = _find_summary_start(sheet.name, spec, rows)
+    dropped = _drop_cells(spec, rows, head_end, summary_start)
+    if spec.form_values_are_amounts:
+        _form_values_as_amounts(sheet.name, spec, rows, head_end, summary_start)
     # Typo corrections of the descriptive texts (after the fixes, which check the original texts).
     for cells in rows.values():
         for key, cell in cells.items():
@@ -425,52 +508,99 @@ def _read_sheet(book: xlrd.book.Book, sheet: xlrd.sheet.Sheet, spec: Pb1TabSpec)
             widths[key] = max(widths[key], len(header))
     return Pb1Sheet(
         spec=spec, name=sheet.name, headers=headers, column_widths=widths, rows=rows, summary_start=summary_start,
-        head_end=head_end,
+        head_end=head_end, dropped=dropped,
     )
 
 
-def read_pb1_workbook(path: Path) -> Pb1Workbook:
-    book = xlrd.open_workbook(path, formatting_info=True, on_demand=True)
-    try:
-        sheets: dict[str, Pb1Sheet] = {}
-        raw: dict[str, dict[str, CellValue]] = {}
-        company_name = None
-        for spec in PB1_TABS:
-            name = next((n for n in book.sheet_names() if n.strip().startswith(spec.sheet_prefix)), None)
-            if name is None:
-                logger.warning("PB-1 %s: no sheet %r…; tab %s left out", path.name, spec.sheet_prefix, spec.key)
+DESCRIPTION_COLUMN = "B"
+
+
+def _form_values_as_amounts(sheet_name: str, spec: Pb1TabSpec, rows: dict[int, dict[str, Pb1Cell]],
+                            head_end: int, summary_start: int | None) -> None:
+    """Makes every value-column cell of the form lines an amount field (spec.form_values_are_amounts);
+    blank text counts as empty. A cell holding real text is left as it is (WARNING)."""
+    for r, cells in rows.items():
+        if r <= head_end or (summary_start is not None and r >= summary_start):
+            continue
+        description = cells.get(DESCRIPTION_COLUMN)
+        if not str((description.value if description else None) or "").strip() and not any(c.amount for c in cells.values()):
+            continue  # a spacer row (no description, no amount): no fields
+        for key in spec.value_columns:
+            cell = cells.get(key)
+            if cell is None or cell.amount or cell.dropped or cell.hidden:
                 continue
-            sheet = book.sheet_by_name(name)
-            sheets[spec.key] = _read_sheet(book, sheet, spec)
-            raw[spec.key] = _raw_values(sheet)
-            if spec.key == DEFAULT_TAB:
-                # The company name is the last text in column B above the header ("PB 1 2025" is the title).
-                # Header row (0-based): the row before the first form row (after the head rows).
-                read = sheets[spec.key]
-                form_rows = [r for r in read.rows if r > read.head_end]
-                header_row = min(form_rows) - 2 if form_rows else 0
-                company_name = next(
-                    (str(sheet.cell_value(r, 1)).strip() for r in range(header_row - 1, -1, -1)
-                     if isinstance(sheet.cell_value(r, 1), str) and sheet.cell_value(r, 1).strip()
-                     and not sheet.cell_value(r, 1).strip().upper().startswith("PB")),
-                    None,
-                )
-        if DEFAULT_TAB not in sheets:
-            raise ValueError(f"Sheet {PB1_TABS[0].sheet_prefix!r} not found")
-        return Pb1Workbook(workbook=path.name, company_name=company_name, sheets=sheets, raw=raw)
-    finally:
-        book.release_resources()
+            if isinstance(cell.value, str) and cell.value.strip():
+                logger.warning("PB-1 sheet %r cell %s%d holds text %r; not an amount field", sheet_name, key, r, cell.value)
+                continue
+            value = None if isinstance(cell.value, str) else cell.value
+            cells[key] = replace(cell, value=value, amount=True)
 
 
-_cache: dict[Path, tuple[float, Pb1Workbook]] = {}
+def _drop_cells(spec: Pb1TabSpec, rows: dict[int, dict[str, Pb1Cell]], head_end: int,
+                summary_start: int | None) -> frozenset[tuple[int, str]]:
+    """Empties the cells that are not part of the form (spec.summary_dropped_columns,
+    spec.section_rows_empty) in `rows` (Pb1Cell.dropped); returns them as (row, column)."""
+    dropped: set[tuple[int, str]] = set()
+    keep = {*spec.narrow_columns, DESCRIPTION_COLUMN, spec.comment_column}
+    for r, cells in rows.items():
+        if r <= head_end:
+            continue
+        if summary_start is not None and r >= summary_start:
+            gone = [k for k in cells if k in spec.summary_dropped_columns]
+        elif spec.section_rows_empty:
+            description = cells.get(DESCRIPTION_COLUMN)
+            section = description is not None and description.bold and str(description.value or "").strip()
+            gone = [k for k in cells if k not in keep and (r, k) not in spec.section_hidden] if section else []
+            if section:
+                for key in cells:
+                    if (r, key) in spec.section_hidden:
+                        cells[key] = replace(cells[key], hidden=True)
+        else:
+            gone = []
+        gone += [k for k in cells if (r, k) in spec.dropped_cells and k not in gone]
+        for key in gone:
+            cells[key] = Pb1Cell(value=None, number_format="General", bold=False, dropped=True)
+            dropped.add((r, key))
+    for r, cells in rows.items():
+        if r <= head_end:
+            dropped.update((r, k) for k in spec.head_dropped_columns)
+    return frozenset(dropped)
 
 
-def load_pb1_workbook(path: Path) -> Pb1Workbook:
-    """read_pb1_workbook with a cache that is invalidated when the file changes."""
-    mtime = path.stat().st_mtime
-    cached = _cache.get(path)
-    if cached and cached[0] == mtime:
-        return cached[1]
-    workbook = read_pb1_workbook(path)
-    _cache[path] = (mtime, workbook)
-    return workbook
+def match_tab_sheets(workbook: str, sheets: list[SheetCells]) -> dict[str, SheetCells]:
+    """tab key -> the sheet of that tab (by sheet name), in PB1_TABS order."""
+    matched: dict[str, SheetCells] = {}
+    for spec in PB1_TABS:
+        sheet = next((s for s in sheets if s.name.strip().startswith(spec.sheet_prefix)), None)
+        if sheet is None:
+            logger.warning("PB-1 %s: no sheet %r…; tab %s left out", workbook, spec.sheet_prefix, spec.key)
+            continue
+        matched[spec.key] = sheet
+    return matched
+
+
+def build_pb1_workbook(workbook: str, tab_sheets: dict[str, SheetCells]) -> Pb1Workbook:
+    """The PB-1 form from the sheets of its tabs, read from the file or from the database."""
+    sheets: dict[str, Pb1Sheet] = {}
+    raw: dict[str, dict[str, CellValue]] = {}
+    company_name = None
+    for spec in PB1_TABS:
+        sheet = tab_sheets.get(spec.key)
+        if sheet is None:
+            continue
+        sheets[spec.key] = _read_sheet(sheet, spec)
+        raw[spec.key] = _raw_values(sheet)
+        if spec.key == DEFAULT_TAB:
+            # The company name is the last text in column B above the header ("PB 1 2025" is the title).
+            # Header row (0-based): the row before the first form row (after the head rows).
+            read = sheets[spec.key]
+            form_rows = [r for r in read.rows if r > read.head_end]
+            header_row = min(form_rows) - 2 if form_rows else 0
+            company_name = next(
+                (_text(sheet, r, 1).strip() for r in range(header_row - 1, -1, -1)
+                 if _text(sheet, r, 1).strip() and not _text(sheet, r, 1).strip().upper().startswith("PB")),
+                None,
+            )
+    if DEFAULT_TAB not in sheets:
+        raise ValueError(f"Sheet {PB1_TABS[0].sheet_prefix!r} not found")
+    return Pb1Workbook(workbook=workbook, company_name=company_name, sheets=sheets, raw=raw)

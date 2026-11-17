@@ -13,4 +13,3 @@ frontend/dist/
 .env.local
 
 frontend/.vite/
-backend/data/

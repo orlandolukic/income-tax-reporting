@@ -997,3 +997,477 @@ Requested by the user before constructing 2026: check the transfer, editing, lef
 ### Test results
 - Scratch database: PB-1 migration suite 19 checks passed: the status lists the PB-1 forms; 2026 PB-1 for all 165 × 3 tabs, same structure as 2025, all amounts 0; FRIGOLAKTA 2026 without file values or loss, 2025 unchanged; years moved on in tab titles, headers and texts; head (name, months, label, fills); 2025 settings taken over (a konto edit and a changed default comment), a 2025 company comment not; formulas; 2026 edits and comments apart from 2025; the loss rule in 2026; PDF; 2027 via 2026 ("PB 1 2027", "Uporedo 2027 i 2026"). The **2026 view equals the 2025 view cell by cell for all 165 × 3 tabs** (flags, formats, fills, shading, texts with years moved on), except the differences that come from 2025's values (FRIGOLAKTA's tax locked by its 2025 loss). Migration suite 27 and PB-1 suite 73 checks passed.
 - Real database (read-only comparison): 2026 PB-1 for all 165 × 3 tabs, 0 differences to the 2025 view, 0 non-zero amounts; PDF 200. Browser: FRIGOLAKTA 2026 — tabs "Poreski bilans | Uporedo 2026 i 2025 | Preliminarni rezultat", head "PB 1 2026 | Meseci poslovanja | 12 | 0,00 | 0,00", 80 rows, comments panel, the three company buttons, no loss banner.
+
+---
+
+## 2026-11-13: Session 32: Everything in PostgreSQL, no more contact with the Excel files
+
+User's rule: from the introduction of PostgreSQL, everything is stored in it and the app no longer touches the Excel files. Before this session PostgreSQL held only the GFI data; the PB-1 form was read from `2025 PB-1.xls` on every request, PB-1 edits / company values / default comments were in SQLite `edits.db`, the user was hard-coded and sessions were in memory.
+
+### Completed
+- **Schema** (migration `0007`, `alembic check` clean; downgrade refuses while any of the new tables holds data):
+  - PB-1 workbook snapshot under a `source_file` of kind 'pb1' (origin 'workbook'): `pb1_sheet` (tab, sheet name, order, used range), `pb1_sheet_column` (Excel widths), `pb1_source_cell` (every cell with a value or a format: kind empty/text/number/bool/error, value, number format, bold, fill; CHECK: one value matching the kind).
+  - `pb1_template_edit` (year, tab, row, col: shared by every company), `pb1_company_edit` (company_year, tab, row, col: amounts, comments, months; FK RESTRICT), `pb1_comment_default` (year, tab, row; source "workbook" / "year <y>"). Each edit keeps the value shown before the first edit (original_*), as in SQLite.
+  - `app_user` (username, password hash, active; the user `nikola` carried over with the same hash), `user_session` (only the SHA-256 of the cookie token).
+- **`app/pb1_workbook.py`:** the reader works on `SheetCells` (cells, used range, widths) instead of xlrd objects, so the same code builds the form from the file or from the database (`build_pb1_workbook`). Checked: the refactored reader gives exactly the old result (repr equal).
+- **`app/pb1_store.py` (new):** `PostgresPb1Store` (form from the snapshot, cached per source_file; constructed years follow `based_on_year` back to an imported form; edits, company values and defaults in the new tables) and `ExcelPb1Store` (file + SQLite, the fallback without a database). `app/pb1.py` uses only the store; `app/migration.py` builds a constructed year's PB-1 form from the database only (`form_source`, `copy_form_settings`).
+- **`app/pb1_import.py` (new):** `python -m app.pb1_import <year> [--dry-run] [--replace]`. Stores the snapshot, checks form from database == form from file, carries over all SQLite PB-1 data of that workbook for every year using the form (2025, 2026, 2027), completes the year's default comments from the workbook, compares the PB-1 link, then builds **every company's tables in every year and tab twice** (file + SQLite vs. database) and commits only if all are equal. `--replace` refuses while PB-1 values are stored; `gfi_import --replace` now also refuses while PB-1 values of that year's companies exist.
+- **`app/users.py` / `app/auth.py`:** users and sessions from PostgreSQL (sessions survive a backend restart; logout deletes the session); built-in user + memory only without a database.
+- `computed_cells` cache keyed by the loaded form object instead of the file name.
+- Docs: README (Data files, Database steps 6–7, users), CLAUDE.md (layout, commands, data rules: PostgreSQL is the only data store), `.env.example`, `edits_store` docstring, startup log line.
+
+### Real database (done in this session)
+- `alembic upgrade head` (0006 → 0007), `pb1_import 2025 --dry-run`, then the import: 3 sheets, 41 column widths, 1,371 cells; carried over 0 template edits, 1 company value (2027, 1. OKTOBAR, Poreski bilans C33 = 1.000), 57 default comments (19 each for 2025, 2026, 2027); PB-1 link the same in SQLite and PostgreSQL; 993 tables verified equal (165 + 165 + 1 companies × 3 tabs).
+- SQLite `edits.db` was only read (unchanged; it stays as a backup and is no longer used).
+
+### Test results
+- **Baseline before any change:** every PB-1 table (993) dumped from the original code. After the import, the app reading the real database with `GFI_DATA_DIR` pointed to an **empty folder** produced the same 993 tables: **0 differences**.
+- Scratch copy of the database (`pg_dump` → `income_tax_reporting_scratch`, dropped afterwards), the backend run by uvicorn with an empty data folder: 37 checks passed: login from `app_user`, wrong password 401, session stored only as SHA-256, years / GFI 2025 from the database, PB-1 all tabs for FRIGOLAKTA with values, loss banner, head rows and fills, 2026 form, PDF; an amount saved / read / not seen by another company / reverted (row removed); a template konto edit seen by every company and reverted; a company rate 7% with the default 5% for others; GFI `--replace` refused while PB-1 values exist; Migracija status from the database, constructing 2028 with 19 default comments and a working PB-1 form; the session survives a backend restart, logout removes it; `edits.db` unchanged; the data folder stayed empty. Also: `pb1_import --replace` refused, downgrade refused, the Excel + SQLite fallback still equal to the baseline (9 of 9 tables, on a copy of `edits.db`).
+
+### Changes
+- With `DATABASE_URL` set the app reads no Excel file and no SQLite file. Only the imports read them.
+- Logged-in browser sessions from before this change were in memory; everyone has to log in once again.
+
+### Open / next tasks
+- User: log in again and check Home, Company Registry and PB-1 (FRIGOLAKTA) in the browser.
+- 2027 exists with 1 company (1. OKTOBAR, made 2026-11-12 17:41 by nikola) and one PB-1 value; the user hasn't said yet whether it was a test. A constructed year can't be deleted in the app.
+- Still in code, not data: the PB-1 formulas (`pb1_formulas.FORMULAS`, extracted from the 2025 workbook), the form layout rules (`PB1_TABS`) and text corrections (`pb1_texts`).
+- Possible later: a change history for PB-1 edits (GFI has `change_log`), session expiry, user management.
+
+---
+
+## 2026-11-13: Session 33: Excel / SQLite mode removed; the app never touches the Excel files
+
+User's decision: the two Excel files stay in the folder, but the app must have no contact with them (only an explicit, user-requested import reads them); deleting them must not affect the app. The fallback mode (no `DATABASE_URL` → Excel + SQLite) is removed, so the separation is guaranteed by the code, not by a setting.
+
+### Completed
+- Removed: `ExcelGfiStore`, `ExcelPb1Store`, `app/edits_store.py` (SQLite), the built-in user and in-memory sessions, the GFI / PB-1 store protocols and every `database_enabled()` branch in the app. `GfiStore` and `Pb1Store` are the PostgreSQL classes (formerly `PostgresGfiStore` / `PostgresPb1Store`).
+- **Without `DATABASE_URL` the backend refuses to start** (CRITICAL "DATABASE_URL is not set …; not starting").
+- Excel reading moved to import-only modules: `app/gfi_workbook.py` (openpyxl; also the data folder lookup, moved from `reporting_years.py`) and the new `app/pb1_file.py` (xlrd). The table types are in the new `app/gfi_table.py`; `app/pb1_workbook.py` builds the form from `SheetCells` without any Excel library. `reporting_years.py` is only the API.
+- Imports: `gfi_import` and `pb1_import` no longer read SQLite (its data was carried over in sessions 29 and 32). `pb1_import` verifies every company's tables with the form from the file vs. from the database (same stored edits); the read caches (`load_source_table`, `load_pb1_workbook`) are gone.
+- `backend/data/edits.db` is left untouched on disk as a backup; nothing reads or writes it. Docs: README, CLAUDE.md, `.env.example` (`DATABASE_PATH` removed).
+
+### Test results
+- Loading the app (`app.main`) loads **no** `openpyxl`, `xlrd` or `sqlite3`; only the import commands load the Excel libraries.
+- Real database, data folder pointed to an empty folder: all 993 PB-1 tables equal to the baseline of the original code (0 differences).
+- Scratch copy of the database, backend run by uvicorn with an empty data folder and no SQLite file: 43 checks passed (login and sessions, Home and Registry edits incl. a number and a referent, PB-1 all tabs, PDF, amount / template / comment edits, Migracija constructing 2028 with its PB-1 form, session after restart, logout; no SQLite file created; folder stayed empty). `pb1_import --replace` refused (PB-1 values stored); `gfi_import 2025 --replace --dry-run` passed its verification against the workbook.
+- Backend started without `DATABASE_URL`: refused (exit code 3).
+- Import from zero into an empty database: `alembic upgrade head`, `gfi_import 2025` (verification passed), `pb1_import 2025` (19 default comments, 495 tables verified): the 2025 tables equal the baseline (0 differences of 495).
+
+### Open / next tasks
+- User: log in again and check the app in the browser.
+- 2027 with 1 company (1. OKTOBAR) and one PB-1 value: keep or remove (user to decide).
+
+---
+
+## 2026-11-13: Session 34: Old SQLite database deleted; PostgreSQL is the only store
+
+User's request: remove the old database completely, after checking that nothing is lost, so that the only way for the system to remember anything is PostgreSQL. This closes the database setup.
+
+### Completed
+- **Audit before deleting** (read-only): the old store was one file, `backend/data/edits.db` (no other SQLite files or backups in the project). Its 4 tables held 59 rows: `cell_edits` 0, `pb1_links` 1 (2025 PB-1 → FRIGOLAKTA, row 119), `pb1_edits` 1 (2027, 1. OKTOBAR, Poreski bilans C33 = 1000), `pb1_comment_defaults` 57 (19 each for 2025, 2026, 2027); no views or triggers. Every row was found in PostgreSQL with the same value, original value, user and time (0 problems).
+- **Deleted:** `backend/data/edits.db` (SHA-256 84cf5171…ac4f2) and the empty `backend/data/` folder; `backend/data/` removed from `.gitignore`.
+- **Only PostgreSQL accepted:** `app/db.py` refuses a `DATABASE_URL` that is not PostgreSQL (the SQLite test branch is gone); `BigId` in `app/models.py` is a plain `BigInteger` (the old migrations keep their historical SQLite variant; `alembic check` clean). The app loads no `sqlite3`.
+- Docs: README, CLAUDE.md (anything to remember: a model in `app/models.py` + an Alembic migration, nothing else).
+
+### Test results
+- `DATABASE_URL=sqlite:///…` → "DATABASE_URL must be a PostgreSQL database, not sqlite" (no file created).
+- After the deletion, the real database with the data folder pointed to an empty folder: all 993 PB-1 tables equal to the baseline of the original code (0 differences); the running backend healthy, no errors in the log.
+
+### Open / next tasks
+- User: log in again and check the app in the browser.
+- 2027 with 1 company (1. OKTOBAR) and one PB-1 value: keep or remove (user to decide).
+
+---
+
+## 2026-11-13: Session 35: Deleting the latest constructed year (Migracija)
+
+Requested by the user: a red button that deletes a year constructed on the Migracija page completely, after a confirmation ("Da li stvarno želite da obrišete …?"); only on the latest year, because only that one makes sense to delete (it may be the wrong one).
+
+### Completed
+- **Backend** (`app/migration.py`): `delete_year` + `DELETE /api/migration/years/{year}`. Allowed only for the latest year and only if it was constructed (409 otherwise: "Only the latest year …", "… comes from a workbook …"; 404 unknown year; 409 if another year is built from it). Removes, in one transaction: the year's PB-1 company values, template edits and default comments, the PB-1 link, its source files (cascade: columns, snapshot cells, company years, import issues; also a PB-1 form), the reporting year; then companies / referents / offices no year uses any more. `change_log` is kept (project rule: history is always kept); its rows of that year keep year/row/values with `company_year_id` NULL. Logged as WARNING with the counts. `YearInfo.deletable` marks the one deletable year.
+- **Frontend** (`MigrationPage`): a red `destructive` "Obriši…" button (Trash2) only on the deletable year's row; it opens an `AlertDialog` (added with the shadcn CLI; its `cn` import fixed again and the stray `cn` package uninstalled; the CLI's question to overwrite `button.tsx` answered no): "Da li stvarno želite da obrišete <year>?", what is deleted (companies with all values, PB-1 form with all entered amounts and comments), "cannot be undone", "edit history is kept"; buttons "Otkaži" and the red "Obriši <year>" with a spinner; errors shown in the dialog. Afterwards a message with the counts, the year list on the page and the Reporting year selector reload (a selected deleted year falls back to the newest).
+- An unsaved autosave change for a deleted year is rejected (404) and dropped with the usual message.
+
+### Test results
+- Scratch copy of the real database, backend run by uvicorn: 22 checks passed: only 2027 deletable; 2026 / 2025 / unknown refused (409 / 409 / 404); 2027 deleted (1 company, 20 PB-1 values: 1 company value + 19 default comments); nothing of 2027 left, no orphan cells; its 2 `change_log` rows kept; exactly 1 company year and 12 cells removed; companies / referents / offices unchanged; 2025 and 2026 unchanged (Home + PB-1 tables identical); years 2026, 2025 with next 2027; selector without 2027; then 2026 deletable; 2027 constructed again (165) with a working PB-1 form and deleted again; 2026 deleted; 2025 (workbook) not deletable and refused, intact. Scratch dropped.
+- `tsc` passes. Not checked in the browser (no login in this session).
+- The real database is unchanged: 2027 is still there; the user decides whether to delete it with the new button.
+
+### Open / next tasks
+- User: try the button in the browser (on 2027 if it should go).
+
+### Addendum: deletion leaves nothing and changes nothing else (2026-11-13)
+User's requirement: the deletion must be consistent: nothing of the year left behind, nothing else disturbed.
+- **History:** the year's `change_log` rows are deleted too (before: kept, which left rows behind). The dialog says so ("… i istorija izmena te godine. Ostale godine ostaju nepromenjene.").
+- **Shared company details:** NAZIV and PIB are also stored on `company`, shared by all years, so an edit in the deleted year had changed them for every year. `_undo_shared_details` restores them from `change_log` before deleting: the last change made in another year, else the value before the first change (later edits in other years are kept).
+- **Bug found by the test and fixed:** `copy_form_settings` (session 32) lost the rate defaults (5%, 5%, 0,1%, 0,5%) when constructing a year: their `Decimal` was not taken as a number, so they were stored empty. Fixed (`_joined`, `to_decimal` accepts `Decimal`). The real database was not affected (2026 / 2027 got their defaults from the SQLite carry-over; all rates checked). Migration `0008`: CHECK `pb1_comment_default` has exactly one value (number or text); applied to the real database, `alembic check` clean.
+- **Tests (scratch copy of the real database, uvicorn), every row of every table compared:**
+  - A, the real deletion of 2027: only 2027's rows disappear (change_log 2, company_year 1, gfi_column 12, pb1_comment_default 19, pb1_company_edit 1, reporting_year 1, source_cell 12, source_file 2); nothing else added or modified.
+  - B, round trip: construct 2027 (165), defaults equal 2026 incl. rates; edits of every kind (numbers, new referent, new office, two renames, PIB, PB-1 amount, template konto, company rate, Uporedo amount, 2 companies hidden / 1 back), delete: **the whole database is identical to the state before construction** (0 differing rows in every table).
+  - C: a PIB edit in 2027, then in 2026; deleting 2027 keeps the 2026 edit.
+  - 35 checks passed; the delete suite (22, now expecting the history removed) and the general suite (42) pass. `tsc` passes.
+
+---
+
+## 2026-11-13: Session 36: Constructed years behave exactly like their source year
+
+The user noticed that 2026 (constructed 2026-11-12) didn't keep some agreed behavior, and set the rule: a construction follows every established rule, so nothing in the new year behaves differently; things added later must be carried by the next construction as they are in the current state (they apply to imported and constructed years alike, and each year is the base for the next). Saved in memory and CLAUDE.md.
+
+### Found (2025 vs the 2026 constructed with the old code, cell by cell through the API)
+- 44 status cells empty in 2025 (Preliminarni 8, GFI uradjen 8, PB-1, PB-2 14, Predat 14) were 0 in 2026: Home could edit them (Home edits only cells holding a number) and colored them red.
+- 24 PIBs stored as numbers in 2025 were text in 2026 (different alignment in the Registry); 2 blank (" ") office cells were empty instead.
+- The `editable` / `formula` / `text` flags and formats were the same.
+
+### Completed
+- `_copy_company` (app/migration.py) builds a company's row as a copy of its source row: every snapshot cell is the source year's original cell (kind, value, format, formula flag); then only the agreed changes: status and formula columns holding a number → 0 (empty / text stay as they are, `company_year` status None for them); company details = current values, the source cell copied as it is when unchanged (PIB as number stays a number; a changed digits-only PIB that was a number stays a number); unmapped columns copied.
+- **Table policies:** `YEAR_TABLES` / `GLOBAL_TABLES` in `app/migration.py` say for every table what construction and deletion do with it; `check_table_policies()` runs at backend startup and refuses to start when a table has no policy (or a listed one doesn't exist), so a table added later can't be missed by the Migracija.
+- CLAUDE.md (Migracija rules), memory `migration-preserves-behavior`.
+
+### Test results (scratch copies of the real database, uvicorn)
+- Old 2026 deleted and constructed again: **2025 vs new 2026 identical in every cell** except the 1,111 status numbers set to 0 (same columns, rows, flags, formats, value kinds; the same 221 empty cells; the same 781 cells editable on Home); 2027 built from the new 2026 identical to 2026 the same way; PB-1 form of the new 2026 as before.
+- Round trip construct → edits of every kind → delete: database identical (B), later 2026 PIB edit kept (C): 27 checks passed; general suite 42 passed; an unclassified table is refused by `check_table_policies`.
+
+### Open / next tasks
+- The real 2026 was constructed with the old code (the differences above). It holds no user data (no edits, no PB-1 values, no history): to be deleted and constructed again with the new code, after the user's OK.
+
+### Addendum: check before the user constructs 2026 again (2026-11-13)
+- The user deleted 2026 (19:03), constructed it with the new code (19:03:31) and deleted it again (19:04). Real database now: only 2025 (165 companies, 1,980 cells, 13 referents, 8 offices, PB-1 snapshot 1,371 cells, link FRIGOLAKTA, 19 default comments with the rates), nothing of any other year, no orphans. The running backend has the new construction code (loaded 18:57:54).
+- Rehearsal on a scratch copy of exactly this state, through the API as the browser does it: Migracija offers 2026 from 2025; the dialog lists 165 companies, all proposed; 2026 constructed; 2025 vs 2026 identical in every cell except the 1,111 status numbers → 0; the same 781 cells editable on Home; no cell marked edited; status shows the constructed PB-1 form; the PB-1 tables of all 165 companies × 3 tabs equal this morning's 2026 forms; default comments equal 2025 (rates included); deleting it leaves the database identical to before. 14 checks passed.
+- Test harness note: the scratch test servers (port 8011) are now stopped with their whole process tree (`taskkill /T`); leftovers from earlier runs were stopped (only processes started by these tests, never the app on port 8000).
+- **The user constructed 2026 (19:15:46, nikola, 165 companies). Real database checked read-only, with the data folder pointed to an empty folder: 19 checks passed**: same columns and rows as 2025; every cell behaves like 2025, only the 1,111 status numbers are 0; the same 781 cells editable on Home and the same 221 empty cells; no cell edited, statistics 0; Migracija: 2025 + 2026 (constructed from 2025, PB-1 form "2026 PB-1 (iz 2025)", the deletable one), next 2027; each company keeps its identity and row; NAZIV / REFERENT / office carried; referents 13, offices 8; 1,980 cells, 12 columns; no edits, PB-1 values or history; 19 default comments equal 2025 incl. rates; one PB-1 link (2025 FRIGOLAKTA); no orphans; PB-1 of all companies for 2025 and 2026 (990 tables) equal to this morning's.
+
+---
+
+## 2026-11-13: Session 37: Pointing-hand cursor on everything clickable
+
+User's request, kept as a permanent rule (CLAUDE.md design guidelines, memory `ui-pointer-cursor`): when the mouse is over something clickable it shows the pointing hand, as usual on the web, never the default arrow (Tailwind v4 gives buttons the arrow).
+
+### Completed
+- `src/index.css`, base layer: `cursor: pointer` for enabled buttons, `[role=button|tab|checkbox|switch|combobox]` (not aria-disabled), `summary`, `label[for]`, enabled `select`, `a[href]`. In the base layer so a component's own cursor class still wins (sidebar rail resize cursors, `cursor-not-allowed` on disabled fields).
+- Outside the layers (shadcn sets `cursor-default` on them as a utility): dropdown menu items (plain, checkbox, radio, sub-trigger) and select items, when not disabled. The vendored components are not edited.
+- Table cells that open an editor on click (Home / Registry `CompanyTable`, PB-1 `Pb1Table`) and the PB-1 comments: `cursor-pointer` while not editing (Home / Registry had the text cursor before). Read-only cells keep the arrow.
+
+### Test results
+- `tsc` and build pass; the built CSS contains the rules. Not checked in the browser (no login in this session): the user checks it.
+
+---
+
+## 2026-11-14: Session 38: UI language rule (passive UI English, messages Serbian)
+
+The sidebar and the app mixed languages ("General / Home / Companies / Company Registry" next to "Administracija / Migracija"; PB-1 buttons and Migracija page in Serbian, save status and errors in English). User's decision, kept as a rule (CLAUDE.md project rule 4, memory `ui-language-rule`): **everything passive in English** (navigation, titles, button / tab / field labels, placeholders, app-made headers, badges, counters, aria labels); **every message addressed to the user in Serbian** (errors, warnings, success / info alerts, confirmation questions and explanations, save status, loading text, empty states, validation, explanatory tooltips, page / card descriptions, backend messages shown in the UI). Data (Excel headers, PB-1 texts, sheet names, company names) is not translated; code, logs and docs stay English.
+
+### Completed
+- **Sidebar:** Administration → Migration (was Administracija → Migracija); General / Home / Companies / Company Registry unchanged.
+- **English labels:** Migration page (title, "Next year: …", "Construct …", "Years", "constructed from …", "… companies", "PB-1: none", "Edit companies…", "Open", "Delete…", dialog buttons "Cancel" / "Delete …"), company dialog (search placeholder, "Select all", "Clear all", "Selected X of Y · shown Z", "Cancel", titles "Companies for / in …", "Construct …", "Save selection"), PB-1 company actions ("Save changes", "Download PDF", "Print PDF"), comments panel "Comments".
+- **Serbian messages:** save status ("Čuvanje…", "Sve izmene su sačuvane", "Sačuvano u …", "N nesačuvanih izmena je zadržano" with Serbian plural forms, "novi pokušaj…"), autosave errors, cell tooltips ("Kliknite za izmenu", "Izmenjeno. Vrednost iz Excela: …", "Formula (samo za čitanje)", "Prazno u Excelu (samo za čitanje)", "Red u Excelu: …", "Kolona …", "Redni broj u listi firmi", "PB-1 · Uporedo (tekuća i prethodna godina)"), validation, load errors, empty state ("Još nema nijedne godine u bazi."), statistics "… je ukupno 0", Login description and errors, session expired, Company Registry description, server-error fallbacks ("Greška na serveru (HTTP …).").
+- **Backend:** every `HTTPException` / Migracija / PB-1 error message the UI can show is Serbian (auth, cell edits, company details, Migracija construct / change / delete, PB-1 fields, PDF). Logs stay English.
+- Docs: CLAUDE.md (rule 4, labels in the Migracija / PB-1 sections), README.
+
+### Test results
+- `tsc` and build pass; general suite on a scratch copy 42 checks passed; sample backend messages checked ("Može se obrisati samo poslednja godina (2026).", "PB-1 polje C86 se računa formulom.", …). Not checked in the browser (no login in this session).
+
+---
+
+## 2026-11-14: Session 39: Approved editability, page by page (locked) — Home
+
+User's decision: which fields can be changed is defined now, once, page by page and field by field; it applies to every view, company and year (so every Migracija carries it on), and is never changed except on the user's explicit request (CLAUDE.md "Approved editability (locked)", memory `editable-fields-locked`).
+
+### Home (approved; only one change)
+- Kept as it is: `#`, Naziv (PIB), REFERENT, office read-only; kom … PB-1, PB-2 Predat editable as numbers only in cells holding a number in the year's original; formula columns read-only; Actions open the PB-1 tabs; statistics display only.
+- **Changed:** GFI ZA RAD and PB-1,PB-2 za rad are shaded on Home (`bg-muted/60`, new `shadeFormula` prop of `DataCell`, set for the Home variant; applied to cells with `formula`), so they read as computed by formula, not filled in. Status colors (1 green / 0 red) stay. Company Registry unchanged.
+- `tsc` and build pass. Not checked in the browser (no login in this session).
+
+### Open / next tasks
+- Next pages with the user: Company Registry, PB-1 (three tabs, comments), then the automatic check of the approved definition.
+
+### Edit Company Data (formerly Company Registry), approved 2026-11-14
+- **Renamed** so the name says important fields are edited here: sidebar item, page title and address are now "Edit Company Data" / `/edit-company-data` (the old `/company-registry` redirects), page `EditCompanyDataPage` (file renamed with `git mv`), sidebar icon `SquarePen` (was `Building2`); the Serbian description says what is edited here (name, PIB, referent, office only here, plus the status columns incl. empty cells). Code comments, CLAUDE.md, README and memory updated. The internal variant stays `"registry"`.
+- **Formula columns not shown** on this page: GFI ZA RAD and PB-1,PB-2 za rad (`FORMULA_HEADERS` in `CompanyTable`); the column widths are shared again by the remaining numeric columns. Home keeps them (shaded).
+- **Editability kept as it is and locked** (user: the other fields, also the ones editable on Home, may stay editable here): details as text only here, statuses as numbers incl. empty cells, `#` read-only (CLAUDE.md "Approved editability").
+- `tsc` and build pass. Not checked in the browser (no login in this session).
+
+### kom removed; kom = 1 for every company (2026-11-14)
+User's decision: the kom column goes (it was hidden on Home and left on Edit Company Data) and may be removed from the database too; so the background formula keeps working, kom is **1 for every company, globally** (not stored per company).
+- Before deciding, the user was shown that kom feeds GFI ZA RAD = kom − GFI uradjen and the Home statistics (share of the kom total), and that 2026 had kom 0 for every company.
+- **Code:** `KOM = 1` in `app/models.py`; `FORMULA_FIELDS` operands may be constants: GFI ZA RAD = KOM − GFI uradjen; `kom` removed from `NUMERIC_FIELDS`, `HEADER_FIELDS` and `CompanyYear`; statistics base = KOM × number of companies (`TableStats` now only `base_total` + `columns`; the cards read "x % of N companies"); `company_list` drops the workbook's kom column at import. Frontend: no kom column anywhere (Edit Company Data numeric columns start at Preliminarni).
+- **Migration 0009** (irreversible, downgrade refuses): removed `company_year.kom`, the kom `gfi_column` rows with their `source_cell` snapshot cells, kom `change_log` rows (none). Applied to the real database; `alembic check` clean. Before it, kom was 0 in 2025 for 12 companies (Excel rows 45 LUKA ORLANDIC, 69 DEYA, 71 PLATE, 78 SEB, 79 MHARMONIJA, 160 EGEA DOO, 161 TPM, 162 Trem DOO, 163 ANĐELA MARINKOVIĆ PR, 164 Sanja Aleksić PR, 165 TERMO SIMAX, 166 DAGOTTA d.o.o.), 1 for the other 153, and 0 for all of 2026.
+- **Effects:** GFI ZA RAD of those 12 companies in 2025 is now 1 (they have GFI uradjen 0), so its 2025 total is 34 (was 22); statistics 2025: 13 / 131 / 34 of 165 companies; 2026: GFI ZA RAD 1 for every company (165), as nothing is done yet. Home editable cells 616 per year (the 165 kom cells, hidden on Home, are gone).
+- **Tests (scratch copies):** before / after 0009 every other cell unchanged, GFI ZA RAD = 1 − GFI uradjen in every row, statistics base 165 (12 checks); import from zero into an empty database (11 columns, verification passed; PB-1 495 tables); construct 2026 again equals 2025 (formulas computed), 2027 from it (15 checks); construct → edit → delete round trip identical (27); general suite (42). Real database after 0009: PB-1 of all companies for 2025 and 2026 equal to the morning's (990 tables, 0 differences).
+
+### Input rules for company details and statuses (approved 2026-11-14)
+- **Rules** (Home and Edit Company Data alike): NAZIV upper case, not empty; PIB digits only, 9 (PIB) or 13 (JMBG) digits, empty allowed; REFERENT and office upper case; Preliminarni, GFI uradjen, PB-1, PB-2, Predat only 0 or 1, empty allowed. The user's addition: invalid input is not accepted — the border turns red and the field goes back to its old value.
+- **Backend:** `clean_text` upper-cases NAZIV / REFERENT / office and checks PIB (`PIB_INPUT` = 9 or 13 digits); `check_status_value` refuses anything but 0 / 1 / empty for the status columns (422, Serbian messages).
+- **Frontend (`CellEditor` in `CompanyTable`):** `acceptInput` while typing: upper case for NAZIV / REFERENT / office, digits only and at most 13 for PIB, only one 0 / 1 for statuses (a refused character is not typed in: red flash 600 ms); `numeric` keyboard and `maxLength` for PIB and statuses; on Enter / blur an invalid value (empty NAZIV, PIB not 9 / 13 digits) turns the border red with the reason as tooltip, then after 900 ms the field goes back to its old value (read-only meanwhile). Unchanged values are not sent, so opening a field never stores anything.
+- Existing data checked: PIBs all 9 / 13 digits or empty; statuses all 0 / 1 / empty; not upper case: 19 company names per year, referents Dragan, Keti, Kristina, office Slavija (left as they are; the user decides).
+- Tests: scratch copy, backend via uvicorn: 19 checks passed (upper case for NAZIV / REFERENT / office, empty NAZIV refused, PIB 8 / 10 digits and letters refused, 9 / 13 / empty accepted, statuses 2 / 0.5 / −1 refused, 0 / 1 / empty accepted, formula column still read-only). `tsc` and build pass. The editor's typing behaviour is not checked in the browser (no login in this session).
+
+### Empty values: "-" for text details, 0 for statuses (approved 2026-11-14)
+User's rule: an empty PIB / REFERENT / office is shown only as "-" (REFERENT included, user's answer); the status columns (Preliminarni, GFI uradjen, PB-1, PB-2, Predat) can't be empty: without a value they are 0. Chosen for the existing data (user's answer): write 0 into the database, also in the snapshot, so those cells behave as 0 everywhere (editable on Home too).
+- **Migration 0010:** every empty status cell → 0 in `company_year` and in `source_cell`; then NOT NULL + CHECK (0 or 1) on the four status columns (downgrade removes the constraints, the zeros stay). Before it: 8 Preliminarni, 8 GFI uradjen, 14 PB-1, PB-2, 14 Predat empty cells in 2025 and in 2026 each. Applied to the real database; `alembic check` clean.
+- **Import / construction:** `gfi_import` stores empty status cells as 0 and stops on any other value than 0 / 1 (`_statuses_not_empty`); a construction gives every status cell 0.
+- **Edits:** a cleared status is saved as 0 (`status_value` in the backend, `parseStatus` in the editor); "-" entered in PIB / REFERENT / office means empty (`EMPTY_MARK`; NAZIV "-" is a name). Home shows "-" below the name for an empty PIB (9- and 13-digit PIBs shown).
+- **Effects:** every status cell is editable on Home now (660 per year); statistics unchanged.
+- **Tests (scratch copies):** before / after 0010 only the 44 empty status cells per year became 0, statistics unchanged, every status cell editable on Home, the database refuses NULL and 2 (9 checks); input rules 23 checks (empty status → 0, "-" → empty for REFERENT / PIB); construct equivalence 15; construct → edit → delete round trip 27; general 42 (adjusted: reverting "Keti" now stores "KETI", so the GFI `--replace` is refused because of a changed value); import from zero: no empty status anywhere. Real database: no empty status, statistics 2025 14 / 131 / 34 (the user's own edit of today 20:40, 1. OKTOBAR Preliminarni 0 → 1, is the 14th), PB-1 of all companies unchanged (990 tables).
+
+### Existing company details to upper case (2026-11-14)
+User's decision: convert everything to upper case so the data is consistent.
+- **Migration 0011** (Python `str.upper()`, independent of the database locale): `company.name`, `company_year.name`, referent and office lookups, and the snapshot texts of the NAZIV / REFERENT / office columns → upper case, so nothing shows as edited. Lookups that became duplicates were merged: referent "Kristina" into "KRISTINA", office "Slavija" into "SLAVIJA"; referent "-" and office "-" (from the workbook, 4 companies each per year) are now empty (shown as "-" anyway). `pb1_link.pb1_company` (the name in the PB-1 file) and `change_log` are unchanged. Downgrade does nothing. Applied to the real database; `alembic check` clean.
+- **Import:** `gfi_import` upper-cases NAZIV / REFERENT / office and stores a "-" referent / office as empty (`_details_upper_case`), so a new workbook matches.
+- **Real database after it:** 0 values not in upper case; referents BILJA, DRAGAN, JASMINA, JELENA DELEVIC, KARARINA, KATARINA, KETI, KRISTINA, LIKVIDACIJA, LUKA, ОТКAZ (11, was 13); offices ADMIN, CASH, DO 30/06, FER, LJILJA, SLAVIJA (6, was 8); no stored "-"; no cell marked edited; statistics unchanged (2025 13 / 131 / 34: the user's own Preliminarni edit of 20:40 was reverted by the user at 21:05, see change_log).
+- **Found, not changed (for the user):** referent "ОТКAZ" mixes Cyrillic О, Т, К with Latin A, Z; "KARARINA" (1 company) next to "KATARINA" (1 company) looks like a typo; two different companies are both named "TERMO SIMAX" (already so in the workbook).
+- **Tests (scratch copies):** before / after 0011 only NAZIV (19) / REFERENT (22) / office (5) texts changed per year, all upper case, nothing marked edited, statistics unchanged (10 checks); PB-1: 114 tables differ, only in the company name (19 companies × 3 tabs × 2 years); import from zero: upper case at once, same 11 referents / 6 offices, PB-1 link FRIGOLAKTA; construct equivalence 15, round trip 27, general 42, input rules 23.
+
+### Two referent fixes (2026-11-14)
+User's decision: fix the two findings, leave the two "TERMO SIMAX" companies as they are (they are different companies: Excel row 150 without PIB, referent KRISTINA, no office; row 165 PIB 101679655, DRAGAN, SLAVIJA).
+- **Migration 0012:** referent "ОТКAZ" (Cyrillic О, Т, К + Latin A, Z) → "OTKAZ" (Latin); "KARARINA" merged into "KATARINA"; also in the snapshot texts, so nothing shows as edited. Applied to the real database (`alembic check` clean): 10 referents, no Cyrillic letters left in names / referents / offices, 0 cells edited.
+- Scratch test first: exactly 8 cells per year changed (7 × OTKAZ: rows 44, 48, 50, 53, 54, 116, 142; 1 × KATARINA: row 155), statistics unchanged.
+- Note: the workbook itself still has the old spellings; only a re-import of 2025 would bring them back (not planned).
+
+### Compliance audit of the real database and the Home / Edit Company Data data (2026-11-14)
+- TERMO SIMAX row 150: left as it is (user); its PIB is empty in the database, which the pages show as "-" (the agreed rule; a "-" entered is stored as empty), so nothing to change.
+- Read-only audit, 21 checks passed: NAZIV never empty / "-", all upper case, no stray spaces (495 values); PIB 9 or 13 digits or empty (3 empty, 2 JMBG); referents (10) and offices (6) upper case, not empty, no "-", no duplicates, none unused; no Cyrillic letters; statuses only 0 / 1, never empty; kom stored nowhere; the import snapshot follows the same rules (2,640 cells); for 2025 and 2026 every row: details editable as text, statuses editable 0 / 1, formula columns read-only and correct (GFI ZA RAD = 1 − GFI uradjen, PB-1,PB-2 za rad = PB-1, PB-2 − Predat), no stored "-", no edited cell; statistics of 165 companies. Empty details per year (shown as "-"): PIB 3, REFERENT 8, office 11.
+
+### No tooltips on the Home table headers (2026-11-14)
+- User's request: hovering a header on Home shows no message. Removed the header tooltips "Kolona <letter>" (every column) and "Redni broj u listi firmi" (`#`) in `CompanyTable`; Edit Company Data had none. Recorded in CLAUDE.md (Home approved rules). Then also the "Red u Excelu: N" tooltip of the `#` cells in Home rows was removed (user). The edit tooltips of the data cells ("Kliknite za izmenu", "Izmenjeno. Vrednost iz Excela: …", "Formula (samo za čitanje)", "Prazno u Excelu (samo za čitanje)") stay. `tsc` and build pass; not checked in the browser.
+
+### No mention of Excel in the UI (2026-11-14)
+User's rule: the app's texts never mention Excel. Rephrased: cell tooltips "Izmenjeno. Prvobitna vrednost: …" (was "… Vrednost iz Excela: …") and "Prazno (samo za čitanje)" (was "Prazno u Excelu …"); Migration page "Uvezene godine i godine napravljene ovde."; backend messages "Godina … je uvezena; ovde se menjaju samo napravljene godine." / "… može se obrisati samo napravljena godina.". Recorded in CLAUDE.md (rule 4). Still visible as data: source file names ("2025 GFI TOKK 1.xlsx" under the Home / Edit Company Data title and on the Migration page, "2025 PB-1.xls" on the Migration page and in the PB-1 badge "Values from …"). `tsc`, build pass.
+- Then the file names too (user: the user doesn't need to see them; we know internally): Home / Edit Company Data subtitle "<n> companies" (was "… · 2025 GFI TOKK 1.xlsx"); Migration year badge "imported" (was the file name) or "constructed from <year>", and "· PB-1 form" / "· no PB-1 form" (was "PB-1: <file or constructed name>"); PB-1 badge "Imported values" (was "Values from 2025 PB-1.xls"). The API keeps returning the names (internal use). CLAUDE.md updated. `tsc`, build pass.
+
+---
+
+## 2026-11-15: Session 40: Two themes only (light, dark)
+
+User's request: only a light and a dark theme, no "System". `ThemeProvider`: `Theme = "light" | "dark"`; without a stored choice (or an old stored "system") the operating system's preference is taken when the page loads; no live following of the OS. `ThemeSwitch`: options Light / Dark. `index.html` pre-paint script matches. CLAUDE.md and README updated. `tsc` and build pass; not checked in the browser.
+
+### Home statistics above the table (2026-11-15)
+User's request: move the statistics from the bottom to the top, laid out across the page as before. `GfiTableView` renders `GfiStats` above `CompanyTable` (Home only, `mb-4`), same full-width grid of three cards. So the cards and the table fit the screen together and the cards stay visible, the Home table's scroll box is 8rem shorter (`max-h-[calc(100svh-20rem)]`, Edit Company Data unchanged). Docs / comments updated. `tsc`, build pass; not checked in the browser (no login in this session), the height is estimated from the card size.
+- Then, as the user meant: the statistics stay stuck at the top while the whole page scrolls: the cards' wrapper is `sm:sticky sm:top-16 sm:z-30 bg-background pb-4` (right under the sticky 4rem page header; the table scrolls underneath). Not sticky below `sm`, where the three cards are stacked. `tsc`, build pass; not checked in the browser.
+- Then (user: the outer scrollbar barely moved; show more of the table, the statistics floating at the top): the Home table's scroll box is `max-h-[calc(100svh-14rem)]` (was 20rem), so scrolling the page moves the title / year selector away and the table fills the screen below the sticky cards (4rem header + about 8rem cards + bottom padding). `tsc`, build pass; not checked in the browser.
+
+---
+
+## 2026-11-15: Session 41: PB-1 Poreski bilans head rows without columns E and F
+
+User's decision (structure first, for every company): the three head rows of tab 1 (title / company name with Klasa 5 | Klasa 6 / class totals) keep their place, but their last two columns go, with their values (also from the database); the head ends with Klasa 6.
+- **Found before changing:** E1 (4,874,508) and F1 (=E1*2) are used by nothing; but E3 / F3 were where Klasa 5 / Klasa 6 were typed in (C3 = E3 + J15, D3 = F3 + J19, J15 = 0, J19 empty), and Klasa 5 / 6 feed rows 5, 7, lines 22–25 (D30–D33) and so the tax base. User's answer: Klasa 5 / 6 are entered directly.
+- **Code:** `head_dropped_columns = "EF"` for Poreski bilans (`app/pb1_workbook.py`): those head cells are empty, so the head table (page and PDF) ends with the Klasa 6 column; formulas C3, D3 and F1 removed from `FORMULAS` (`app/pb1_formulas.py`), so C3 / D3 are amount fields entered per company (editable, file values for FRIGOLAKTA: 2,808,783.39 / 1,778,299.20).
+- **Migration 0013:** removed the E1, F1, E3, F3 cells of the Poreski bilans snapshot (1,371 → 1,367 cells) and any stored edit of them (none). Irreversible (downgrade refuses). Applied to the real database.
+- **Checks:** all 990 PB-1 tables compared with the previous state: only E1 / F1 / E3 / F3 emptied in every head, C3 / D3 changed from formula to an entered amount with the same value (FRIGOLAKTA), and for companies without Klasa 6 five pure reference formulas (=D3) now give an empty result instead of 0.0 (shown 0,00 as before; ~20 other formulas already did so); every other cell, the loss and the tax identical. Scratch: after 0013 identical to the code change alone (0 / 990); construct equivalence 15, round trip 27, general 42. Real database after 0013: 0 differences to the expected; FRIGOLAKTA loss −782,907.45 unchanged.
+
+### Styled Uporedo and Preliminarni rezultat tabs (2026-11-15)
+User's request: make tabs 2 and 3 nicer and more readable, free hand, for every company and year.
+- **New `src/components/Pb1Styled.tsx`** (shadcn `Card`, tokens only; looks only, every field still goes through `FieldCell`, now exported from `Pb1Table` with optional `adornment` / `className`, so editing, formulas, colors of negatives and the corner marker are unchanged):
+  - `Pb1ComparisonTable` (Uporedo): one card table with a sticky header; the current year's header emphasized, the previous year's muted; Index cells with a trend arrow and a small bar (`chart-2`, 100 % at half the track, capped at 200 %); section rows shaded with a top rule; spacer rows thin (their fields stay).
+  - `Pb1PreliminaryView` (Preliminarni rezultat): the sheet's parts as cards, found from its structure: left the main calculation (title row → card title, the "# | Opis | RSD" row → its header); right one card per section heading of the right table (Uvecanje / Umanjenje poreske osnovice po Poreskom bilansu, Poreske olaksice), a group whose numbering restarts at 1 separated by a line (Odlozena poreska sredstva / obaveze), "Ukupno …" rows emphasized; below, one card per heading (Podbilansi bilansa uspeha, Troskovi koji se ne priznaju u poreskom bilansu). Column D (an empty spacer column) is not shown.
+  - `Pb1Page` uses them for the two tabs; Poreski bilans unchanged; the PDF unchanged.
+- **Visual check** on a scratch copy of the database (backend 8011 + Vite 5174 with a temporary config, Chrome): FRIGOLAKTA 2025 Uporedo and Preliminarni rendered as intended. Found and fixed afterwards: in the right-hand cards two rows were shaded because the sheet row's shading comes from the left table (now the right cards emphasize only their "Ukupno" rows); Uporedo's spacer row rendered as a full row (now thin, fields kept). The fixes were not seen in the browser: the system stopped the scratch servers for low memory; scratch database, temporary config and leftover Vite process removed. `tsc`, build pass.
+- **To confirm with the user:** column D of Preliminarni (empty, 33 fields editable as shared text) is no longer shown, so those empty fields can't be edited there; part of the PB-1 editability review that follows.
+
+### Preliminarni rezultat: Podbilansi under the main calculation (2026-11-15)
+- User: Uporedo looks good as it is. In Preliminarni rezultat the "Podbilansi bilansa uspeha" card moves up, right under the "Preliminarni rezultat <year>. godine" card in the left column (no reason to keep them apart); the other lower card(s) (Troskovi koji se ne priznaju …) stay below. `Pb1PreliminaryView`: the first lower section is stacked in the left column, the rest as before. `tsc` passes; not checked in the browser.
+- The user sets the order of the remaining open items (column D, PB-1 editability, commit); don't raise them unasked.
+- Then (user): "Troskovi koji se ne priznaju u poreskom bilansu" moves up too, right under Podbilansi in the left column, so both columns end at about the same height. All lower cards are now stacked in the left column; nothing is below the two columns. `tsc`, build pass; not checked in the browser.
+
+### PB-1 "Generate report" (2026-11-15)
+User's request: the two PDF buttons become one, "Generate report", which opens the PDF in a new tab next to the app; the PDF may be styled freely with any library; it contains only the three tabs of the chosen company, **no comments**.
+- **Frontend (`Pb1CompanyActions`):** buttons "Save changes" and "Generate report" (`FileText`, `chart-2` tint). The new tab is opened inside the click (showing "Izveštaj se pravi…"), then the changes are flushed and the tab goes to `.../pb1-pdf?inline=true`, so the browser's PDF viewer keeps the file name ("PB-1 <year> <company>.pdf"). A blocked pop-up or a failed save closes the tab and shows a Serbian error. Props `companyName` / `onUnauthorized` removed.
+- **Backend (`app/pb1_pdf.py`, rewritten, still ReportLab):** A4 landscape report; running header (app name, "PB-1 · year · company") and footer ("Generated <date time>", "Page x of y", two-pass canvas); title block (company, "PB-1 report · year · PIB"), red "Gubitak!" box; numbered section per tab. Poreski bilans: head values as tiles (Meseci poslovanja, Klasa 5, Klasa 6, found from the head rows' label / value layout), the form table (dark header repeated on every page, hairline rows, tinted section rows with an accent rule, negative amounts red; the comment column left out), the closing rows as a result panel with the amounts under their column. Uporedo: current year header accented and its column tinted, Index drawn with a trend arrow and a bar (100 % = half the track), empty rows as thin gaps. Preliminarni rezultat: the page's cards (same structure logic as `Pb1PreliminaryView`), two columns on one page with its section header, stacked full width if they don't fit. Font: Segoe UI first (Arial, DejaVu, Liberation as before).
+- **Checked:** FRIGOLAKTA 2025 rendered and looked at page by page (7 pages; first try left the Preliminarni header alone on a page: height budget and card padding fixed); FRIGOLAKTA 2026, DAGOTTA 2025, TERMO SIMAX 2026 build without error. `tsc` passes. The button flow (new tab, viewer) not checked in the browser.
+- User approved the report ("odlično, sviđa mi se"). New rule: future additions to the three PB-1 tabs are carried into the report when they matter (CLAUDE.md, memory `pb1-report-follows-tabs`).
+
+---
+
+## 2026-11-15: Session 42: Global PB-1 comments and the Global Settings page
+
+User's decision: the comments are no longer per company (default + company override); they are global, the same for every company **and every year** (rules for the form's sections), and are edited only on a new Global Settings page in the sidebar, which collects everything that applies to the whole system.
+- **Data (migration 0014, irreversible):** new table `pb1_comment` (tab, row; a rate as a number or a text; source, updated_by/at) made from `pb1_comment_default`, which is dropped. Before it the migration checks that every year has the same comment for a row (2025 and 2026: the same 19). Company comments (`pb1_company_edit`, Poreski bilans F below the head rows) removed: there were none. Applied to the real database; `alembic check` clean.
+- **Backend:** `pb1_edit_kind` makes the comment column read-only on the PB-1 page (a save is refused, 409); `_cell_view` shows the global comment for every year and company (no year shift applied to comments); `Pb1EditKind` without "comment". `Pb1Store.comments` / `save_comment`; `seed_comments` (import: rows without one only); `copy_form_settings` copies only the template edits; Migracija: `pb1_comment` is a global table (kept by construction and deletion), the delete no longer touches comments. New `app/global_settings.py`: `GET /api/settings/pb1-comments` (rows of the latest year's Poreski bilans with a description, as `Pb1RowOut`), `PUT /api/settings/pb1-comments/{row}` (rate rows: a number, else 422 "Stopa mora biti broj."; texts: spaces normalized; empty removes; unknown row 404).
+- **Frontend:** `GlobalSettingsPage` (`/global-settings`): card "PB-1 comments" with the same comment list as on the PB-1 page (`Pb1Comments`, now taking only rows / summary / comment_column, an optional `note` and `className`), editable by click; each change saved at once, with "Čuvanje…" / "Sačuvano." and an error alert that reverts the value. The PB-1 page shows the comments read-only with the note "Zajednički za sve firme i godine; menjaju se u Global Settings.". Sidebar: "Global Settings" (icon `Settings`) pinned at the bottom, above the user menu (user's request; `footerNavItems`).
+- **Checked (real database, functions called directly):** 19 comments in `pb1_comment`, the old table gone; the settings API returns 84 rows, 19 with a comment, rates as numbers; FRIGOLAKTA 2025 and 2026 show the 19 comments, none editable on the PB-1 page, a PB-1 save of F30 refused; rate of line 25 (row 33) set to 1 %: E33 recomputed in 2025 (247,576.74 → 238,685.25), then reverted, everything equal to before; text on a rate 422, unknown row 404. `tsc` and build pass. The pages were not checked in the browser.
+- **PDF report:** unchanged (comments stay out, user's rule).
+
+### Open / next tasks
+- Only Poreski bilans has a comment column. If the other two tabs should get comments too ("rules for the sections of the three tabs"), that needs the user's decision on where they are shown.
+- User: Global Settings is fine. Added a "Save changes" button (top right, success tint, as on the PB-1 page): it waits for the saves under way and sends again every change that could not be saved; such a change now stays shown (count "Nesačuvanih izmena: N", alert "… Kliknite „Save changes” da pokušate ponovo.") instead of being reverted; a value the server refuses (4xx, e.g. text for a rate) still goes back to the saved one. `tsc`, build pass; not checked in the browser.
+- User: no comments for Uporedo / Preliminarni rezultat for now; only the Poreski bilans set (open item above closed).
+- Then (user): the button moved from the page's top right into the "PB-1 comments" card, right above the comment list, with the save status next to it. `tsc`, build pass; not checked in the browser.
+- PB-1 button renamed "Generate report" -> "Generate PDF report" (user).
+- User: the comment section beside the Poreski bilans table is removed from the PB-1 page (the comments are on Global Settings now); the form table takes the middle of the page (`mx-auto w-full max-w-7xl`), head and summary tables with it. The API still sends the comments (the formulas use the rates); `Pb1Comments` is used only by Global Settings. `tsc`, build pass; not checked in the browser.
+- **Comments on mouse-over** (user): on Poreski bilans, moving the mouse over a row that has a global comment pops the comment up beside the row (shadcn `Tooltip`, right side, popover colors, no arrow: "Comment · # · Opis", then the comment; rates formatted, e.g. 5,00%). Only rows with a real comment (not empty, not "-"); form and summary rows. No highlight or other mouse reaction is added.
+- **No blank comments** (user): a comment of only spaces (one or more, tabs too) or "-" is no comment: Global Settings sends it as empty, the backend removes the comment instead of storing it, and **migration 0015** adds CHECK `ck_pb1_comment_text_not_blank` (`value_text !~ '^\s*-?\s*$'`) to `pb1_comment` (applied; `alembic check` clean). Tested on the real database: "   ", " - ", tab → removed; a direct blank insert refused by the database; row 34 restored afterwards (value and source "workbook"), 19 comments as before. `tsc`, build pass; the tooltip not checked in the browser.
+- Then (user): the Poreski bilans table spans the full width again, as the other two tabs (the `max-w-7xl` wrapper removed). The comment no longer uses a Radix tooltip beside the row (it went left of the table and was cut at the window edge): `CommentTipLayer` shows it in a box above and to the right of the mouse pointer while the mouse is over the row, following it, kept inside the window (below the pointer near the top, shifted left near the right edge); own state, so the table doesn't re-render on mouse moves. The three head rows (title / company, Klasa 5 | Klasa 6 / totals) now start at the form table's left edge (`flushLeft` on `AlignedTable`; widths unchanged). `tsc`, build pass; not checked in the browser.
+- Fix (user: near the right edge the comment wrapped badly toward the bottom of the screen): the fixed box was shrink-wrapped to the space left of it, so near the right edge it became a tall, narrow column; now `w-max max-w-xs` (same width anywhere) and the position is also kept above the window's bottom edge. `tsc`, build pass; not checked in the browser.
+- Then (user): with no room on the right, the comment goes above and to the LEFT of the pointer (instead of being pushed against the right edge). `tsc`, build pass; not checked in the browser.
+- **Poreski bilans closing rows at the top** (user): the four shaded closing rows (V. Poreska osnovica, 69 Poreska osnovica, Porez 15%, Mesecna akontacija) are no longer a table below the form: `SummaryBox` shows them at the top right, beside the head rows (one `flex-wrap justify-between` row), always in sight; only the columns holding something (description and amount): the line-number column (69) and the three empty right columns are gone. Fields, formulas, the loss rule and the mouse-over comments are unchanged.
+- **Report follows** (rule `pb1-report-follows-tabs`): the PDF's result panel at the end of Poreski bilans is replaced by three tiles in the head strip (Meseci poslovanja, Klasa 5, Klasa 6, Poreska osnovica (55+61) > 0, Porez 15%, Mesecna akontacija; negative red), so the results are on the first page; the tile width now counts the gaps correctly (6 tiles fill exactly the 269 mm). FRIGOLAKTA 2025 regenerated and checked page by page (7 pages). `tsc` passes; the page not checked in the browser.
+- Then (user): the head rows' first column (title / company name) is only as wide as its longest text (`compactFirstColumn`, at least 8 characters), C / D keep their form widths in characters; head and closing rows are always side by side (no wrap), the closing-rows box right next to the head rows, the rest of the width left free for later additions. The width measuring of the form table (`useColumnWidths`, `widths` / `flushLeft` of `AlignedTable`) is gone: nothing lines up with measured columns any more. `tsc`, build pass; not checked in the browser.
+
+## 2026-11-16: Session 43: PB-1 field editor never widens its table
+
+- User: opening a field in the closing-rows box made the box much wider. Cause: the box's table has no fixed column widths (sized by its content), and a browser input has a built-in width of about 20 characters, so the amount column grew to it while the field was open. Fix: the PB-1 field editor's input has `size={1}` and the textarea `cols={1}`, so the field only fills its cell; tables with fixed widths (form, head rows, cards) are not affected. `tsc`, build pass; not checked in the browser.
+
+### PB-1 tab 1: head rows and closing-rows box defined (2026-11-16)
+User's decisions (the user defines the PB-1 fields in their own order, starting with tab 1):
+- **Head rows:** editable only Klasa 5 / Klasa 6 (C3, D3), as before; everything else read-only (unchanged).
+- **Closing-rows box:** editable only the field right of "V. Poreska osnovica" (C85), **a company amount** (user's answer; before: an empty shared template number). `AmountFix(85, "B Poreska osnovica", "C")`: the workbook's text is "B Poreska osnovica" (the app shows the correction "V. Poreska osnovica"; the fix matches the original). Nothing uses its value yet.
+- **Porez 15% (C87) is computed** (user's answer): `=IF(C86>0,C86*0.15,0)` added to `FORMULAS` (it was typed in the workbook); so it is read-only for every company; Mesecna akontacija (C88 = C87/D1) follows. The workbook check still passes (FRIGOLAKTA's file value 0 with a negative base).
+- **Locked:** the hidden D / E / G cells of the closing rows (they were editable shared template fields): `pb1_edit_kind` allows only amount fields from `summary_start` on.
+- **Checked (real database, reverted):** FRIGOLAKTA 2025 / 2026 and DAGOTTA 2025: editable in head + box only C3, D3, C85; DAGOTTA C85 = 1,234.50 and Klasa 6 = 1,000,000 → base 1,000,000, Porez 150,000, akontacija 12,500, FRIGOLAKTA's C85 unaffected; D85, E86, G87, C87 refused (409); both edits removed again (no stored edit left). The PDF gets a "V. Poreska osnovica" tile (0,00 unless entered) with the other closing values.
+- Next: the form table of tab 1 (rows 5–84), as the user defines it.
+
+### PB-1 tab 1: hidden box columns not stored; section rows empty (2026-11-16)
+- **Box:** what isn't shown is not kept: the closing rows' columns A (69), D, E, G are dropped (`summary_dropped_columns = "ADEG"`).
+- **Section rows** (bold description: A. Poslovna dobit i gubitak, I…IX, B. Kapitalni dobici i gubici; 11 rows) are read-only and empty (`section_rows_empty`): only `#`, Opis and the comment column remain. C6 (=D3, "I Finansijski rezultat u Bilansu uspeha prihod 6" repeated Klasa 6) removed from `FORMULAS` and dropped; it was used by nothing. **C5 kept for now** (`section_kept`): it is the year's loss (Klasa 6 − Klasa 5 when negative) and an input of Oporeziva dobit (C74); the user is asked where it goes.
+- **Mechanism:** `_drop_cells` in `app/pb1_workbook.py` replaces those cells by empty `Pb1Cell(dropped=True)` (rows keep every column) and lists them in `Pb1Sheet.dropped` (also the head's E/F); `pb1_edit_kind` returns None for them; the calculator reads them as empty (never the file value); `pb1_import` no longer stores them.
+- **Migration 0016** (irreversible): removed those 59 positions (rows 5, 6, 10, 13, 46, 61, 66, 69, 71, 73, 78: C/D/E/G, row 5 without C; 85–88: A/D/E/G) from every Poreski bilans snapshot: 41 stored cells (6 with a value: C6 1,778,299.20, D13 0, A85–A88 incl. 69); no edits stored there. Applied; `alembic check` clean.
+- **Checked:** FRIGOLAKTA 2025 / 2026, DAGOTTA 2025: the 11 section rows show only description (row 5 its C5), nothing editable there; the box rows hold only description and amount; Poreska osnovica unchanged (FRIGOLAKTA −782,907.45); workbook formula check passes (73 computed cells); backend starts.
+- **C5 moved to a fourth head row** (user: keep the locked rows consistent): row "A. Poslovna dobit i gubitak" is now empty like the other section rows; its value (the year's loss, Klasa 6 − Klasa 5 when negative, 0 otherwise; still an input of Oporeziva dobit, so it stays computed and stored: `section_hidden` / `Pb1Cell.hidden`) is shown in an extra head row under Klasa 5 / Klasa 6: label "Gubitak (Klasa 6 - 5)" in the Klasa 5 column (fill #ffcc00 like the label row), value in the Klasa 6 column (fill #ffcc99 like the Klasa 6 value), read-only (`head_result` in the spec, `_head_result_row`). Dropped / hidden cells now render empty and read-only in `build_pb1_table`. FRIGOLAKTA 2025: −1,030,484.19, base unchanged (−782,907.45); 2026 / DAGOTTA 0; a save of C5 refused (409).
+- **PDF:** the new row becomes a tile; with 8 tiles the gap is 3 mm and the values use one size that fits the longest on a line (max 12 pt). Report builds for FRIGOLAKTA 2025.
+- Then (user): the two empty cells under the company name are gone: in the head table the first column's cell covers the empty, read-only cells below it (`mergeFirstDown` on `AlignedTable`, `mergeDown`, new `rowSpan` of `FieldCell` / `rowSpans` of `Pb1RowView`; vertically centred). So the company name spans rows 2–4 next to Klasa 5 / Klasa 6, their values and the Gubitak row. `tsc`, build pass; not checked in the browser.
+- Then (user): the Gubitak value cell gets its own colour: light rose #ffcccc (Excel palette; the fill is the 5th item of `head_result`).
+
+### PB-1 tab 1: the form lines defined (2026-11-16)
+User's rules for the remaining fields of Poreski bilans (everything but `#`, Opis, section rows and formulas stays editable):
+- **C, D, E: company amounts, numbers only.** `form_values_are_amounts` makes every value-column cell of the form lines an amount field (before: 25 / 48 / 5 amounts and 44 / 21 / 64 empty shared template numbers; E37's " " counts as empty). Empty fields show `0,00` (page and PDF). On save an amount is rounded to two decimals (backend; the editor rounds too, e.g. 1234,567 → 1.234,57). Text is refused (422).
+- **Editor (`FieldEditor`) like Home:** a character a number can't hold is not typed in, the border flashes red (600 ms); an invalid value on Enter / blur turns the border red with the tooltip, then the old value comes back (900 ms, field read-only meanwhile).
+- **Konto (G):** edited as free text (numbers kept as typed, e.g. "5627"), shared by every company as before; empty shown as "-" (page: `dash_empty` column flag; PDF too); "-" or only spaces means empty.
+- **Checked (real database, everything reverted; no PB-1 edits were stored before):** tab 1 FRIGOLAKTA: C/D/E 65/64/65 editable amounts + 4/5/4 formulas, Konto 69 text fields; base unchanged (−782,907.45); DAGOTTA: D12 1234.567 → 1234.57, C8 saved for the company only (FRIGOLAKTA's C8 stays empty), "abc" refused, Konto "ABC 12" saved and 5627 restored, "-" on an empty Konto = no change; afterwards 0 company / 0 template edits. `tsc`, build pass; PDFs build (FRIGOLAKTA, DAGOTTA). The editor's typing behaviour not checked in the browser.
+- **Tab 1 is now fully defined** (head, box, section rows, form lines). Next: tab 2 (Uporedo), as the user defines it.
+- Fix (user): the "-" of an empty Konto was also shown in the section rows, whose cells are locked and must stay empty. Now only editable Konto fields show "-" (page: `canEdit`; PDF: `cell.editable`). `tsc`, build pass; PDF builds.
+- **Locked fields showing 0,00** (user listed lines 1, 21, 22–25, 57, 59, 62): they are workbook formulas. Audit of every form formula of the three tabs (recursively through helper formulas): only **D29** (line 21, Ostvareni troskovi = `=+K29`, a helper outside the form that only the file's company has) could not compute for other companies; its formula is removed and it is a company amount now (FRIGOLAKTA keeps the file's 52,549.77, the others 0,00 editable). All other formulas compute from the form; their zeros are real results (line 1 AOP 223 = Klasa 6 − Klasa 5 when positive, 0 for FRIGOLAKTA's loss; line 57 = line 55; 22–25 = Klasa 6 × rate). The user accepted line 59.
+- **No parentheses for negatives** (user, line 62 showed (782.907,45)): amounts whose format writes negatives in parentheses are sent with `#,##0.00;[Red]-#,##0.00` (`_shown_format`), so -782.907,45 in red like the others; checked: no amount in parentheses left on any tab (FRIGOLAKTA 2025). Base unchanged (−782,907.45).
+- **Tab 1 closed** (user). Last change: no bold numbers on Poreski bilans (user): `plain_numbers` in the spec; the API sends `bold` false for amounts and numbers there (E30–E33 Prekoracenje and the closing values were bold from the sheet); texts keep their bold. Checked: no bold number left on tab 1 (FRIGOLAKTA 2025); the page and the PDF follow the API.
+- **Tab 2 (Uporedo):** overview of the current fields sent to the user (formulas / company inputs per row and column; noted: some Index cells are inputs, line 9 tax is typed while tab 1 now computes it); waiting for the user's rules.
+
+## 2026-11-17: Session 44: PB-1 tab 2 (Uporedo)
+
+### Completed
+- **Header borders:** the Uporedo header cells get the same vertical lines as the body columns (`HEAD_BORDER` in `Pb1Styled.tsx`).
+- **Read-only:** `#`, Opis and Index (`readonly_columns=frozenset("BE")` for `uporedo` in `app/pb1_workbook.py`; `#` was already read-only as a narrow column). No Uporedo edits were stored, so nothing is lost.
+- Checked (real database, FRIGOLAKTA 2025 / 2026): only the 2025 / 2024 columns (C, D) stay editable; a save of E18 is refused (409). `tsc` passes; not checked in the browser.
+- PDF report: unchanged (editability and the page's header lines don't concern it).
+
+### Index computed in every line; C / D company amounts (2026-11-17)
+- **Index:** the 8 lines without a workbook formula (E10, E11, E14, E17, E18, E21, E22, E25) get `=+C/D` like the others; listed in `ADDED_FORMULAS` (`app/pb1_formulas.py`) and left out of the workbook check (the file holds " " there). The check still passes (Uporedo 39 computed cells). A division by 0 (#DIV/0!) is shown as 0,00.
+- **<year> / <year-1>:** `form_values_are_amounts=True` for Uporedo: every C / D field of a line is a company amount (numbers only, rounded to two decimals, 0,00 when empty); the editor's red border / revert applies. `_form_values_as_amounts` now skips spacer rows (no description, no amount), so rows 19 and 24 stay thin gaps (Poreski bilans unchanged: C/D/E 65/65/65 editable, Konto 69).
+- **Locked by formula (FRIGOLAKTA 2025):** C (<year>) lines 1, 2, bruto dobit, 6, 7, 8, 11, 12, 13, 14, 15, 18, 19 (C6/C7 = Klasa 6/5, C9/C10/C16 from Preliminarni rezultat); D (<year-1>) bruto dobit, 8, 11, 13, 14, 15, 18, 19; line 9 (porez) is locked in both columns when the base is negative (loss rule).
+- **Checked (real database, reverted):** DAGOTTA 2025 D14 1234.567 → 1,234.57, C14 100 → Index 8.10 %; text refused (422); afterwards 0 company / 0 template edits. PDFs build (FRIGOLAKTA, DAGOTTA). `tsc` passes; not checked in the browser.
+- **PDF:** nothing to add (same values; the Index of the new lines comes through `build_pb1_table`).
+
+### Locked fields audit; Index trend in every line (2026-11-17)
+- **Audit (real database, every active company year: 330 Uporedo forms):** every read-only C / D / E field of a line with a description is a formula; no field is locked for any other reason (line 9 of a company with a negative base is locked by the loss rule, flagged as computed).
+- **Index trend everywhere** (user): the arrow and the bar are shown in every line; an Index of 0 or one that can't be computed (#DIV/0!, shown 0,00) gets the level arrow (`Minus`) and an empty bar (`IndexTrend` in `Pb1Styled.tsx`). The PDF's `IndexCell` does the same (report follows the tabs). `tsc` passes; PDFs build (FRIGOLAKTA, DAGOTTA 2025); neither the page nor the PDF looked at.
+
+- Then (user): the bars sit at the Index cell's left edge, all in one line (the adornment is laid out `justify-between`: marker left, value right), and have a thin outline in the text colour (`outline-foreground`) so an empty bar is visible. PDF `IndexCell` the same (bar at the left edge, arrow after it, dark outline). Seen in the browser (FRIGOLAKTA 2025 Uporedo): bars aligned, outlined, header lines shown. `tsc` passes; PDF builds (not looked at).
+
+## 2026-11-17: Session 45: PB-1 tab 3 (Preliminarni rezultat)
+
+### Completed
+- **Header lines:** only the "# | Opis | RSD" row under "Preliminarni rezultati <year>. godine" gets vertical lines between its cells (`SectionCard` header, `HEAD_BORDER`); nothing else changed.
+- **Read-only:** headers, `#` and Opis (already so) plus the value cells of the section heading rows (G2, G12, G19, C34, C41: `readonly_cells`, new spec field) and the hidden spacer column D (`readonly_columns="BDF"`).
+- **Not bold:** the value right of "Prekoracenje reprezentacije" (G3; `plain_cells`, new spec field). The bold numbers of lines 11, 13, 15 (shaded rows) stay.
+- **Formulas (locked):** C lines 1, 2, 3, Bruto dobit, 6, 7, 8, 11, 13, 14, 15, 16, 17, 18, 19; G right table 1, 3, 4, 5, 6, Ukupno uvecanje, Umanjenje 1, 2, Ukupno umanjenje, Ukupno poreske olaksice. Line 9 (porez, C14) is typed, locked only by the loss rule (FRIGOLAKTA).
+- Seen in the browser (FRIGOLAKTA 2025): header lines and G3 normal weight. `tsc` passes. PDF: unchanged (the API's bold flag already reaches it; header lines are page looks).
+
+### Number fields of tab 3 (2026-11-17)
+- User's rule: the remaining editable fields of the number columns accept numbers only (red border otherwise), two decimals with rounding, 0,00 when empty. **Already true, no code change:** every editable field shown on the tab is an amount field (left C, right G, lower cards C); the other editable number cells (C20, C25, C27, C28, G28, G34–G42) are not shown on the page. Checked on DAGOTTA 2025 (reverted, 0 edits left): text refused (422) in G4, C17, C35; 1234.567 → 1,234.57.
+
+### Every negative number red (2026-11-17)
+- User's rule: on all three PB-1 tabs every negative number is red (inputs and formulas alike), a clear mark of a loss. Before, only numbers whose sheet format had [Red] were red (e.g. the head row "Gubitak (Klasa 6 - 5)" was not).
+- Page: `shownNumber` in `Pb1Table` (used by `display`): any number < 0 is red and always has its minus sign (a format whose negative section has none, e.g. `#,##0;[Red]#,##0`, gets "-" in front). PDF: `format_value` marks every negative red (also General numbers, with the minus), `_cell_para` and the Index text follow.
+- Checked: FRIGOLAKTA 2025 has 14 negative numbers on the three tabs, all red with a minus in the PDF's formatting; the page seen in the browser (head row Gubitak now red). `tsc` passes; PDF builds.
+- **The PB-1 input rules are now defined for all three tabs** (user).
+
+## 2026-11-17: Session 46: PB-1 tab 1: accounting and tax result
+
+User's addition to Poreski bilans: after Klasa 5 / 6 the accounting result (profit or loss), and right under it the tax result, which takes over the "Gubitak!" banner (removed from the top); both right of the closing-rows box, the box and the two results one section. The PDF follows.
+### Completed
+- **Backend:** `Pb1Results` (`accounting`, `tax`: value rounded to two decimals, status profit / loss / zero) in `Pb1Table.results` and `Pb1CellUpdateResult.results` (`_results`: Klasa 6 D3 − Klasa 5 C3; Poreska osnovica C86). FRIGOLAKTA 2025: −1,030,484.19 loss / −782,907.45 loss; DAGOTTA: 0 / 0 zero.
+- **Page:** the banner above the tabs is gone (all tabs). On Poreski bilans the box and two `ResultTile`s (label, badge Dobitak green / Gubitak red / Nula muted, amount red when negative; the tax tile with "Porez i mesečna akontacija su 0." on a loss) in one framed `bg-card` section right of the head rows. The results update with every save (`use-pb1`).
+- **PDF:** no "Gubitak!" box at the top; Poreski bilans: head tiles in one strip, then one framed section with the closing-row tiles and the two result tiles (status line coloured, the loss note). Builds for FRIGOLAKTA and DAGOTTA; not looked at (no PDF renderer here).
+- `tsc` passes. **Not seen in the browser:** Chrome froze on every PB-1 tab (also Uporedo, not changed) with about 400 MB of 3.5 GB memory free; to be checked by the user.
+
+## 2026-11-17: Session 47: PB-1 Preliminary and Final reports
+
+User's request: a styled switch Preliminary / Final; on Preliminary a "done" button that switches to Final; the two are separate reports with separate math; in the database a separate copy for each. Answers: Final is created by its own button from the preliminary report; the preliminary report is locked once done (viewable); Final can't be opened before; "done" sets Home Preliminarni to 1.
+### Completed
+- **Schema (migration 0017, applied, `alembic check` clean):** `pb1_company_edit.report` ('preliminary' / 'final', part of the key, CHECK; existing values preliminary: there were none); new `pb1_report_state` (company_year, preliminary_done_by/at, final_created_by/at; CHECKs: pairs, final only after done). Downgrade refuses while final values / states exist. Migracija: `pb1_report_state` policy (not carried, deleted with the year); `delete_year` removes it.
+- **Backend (`app/pb1.py`, `app/pb1_store.py`):** `Pb1Form.report` / `state` / `locked`; `load_pb1_form(report=None)` (default final once done); the file's amounts only in the preliminary report; final values only from its own stored copy (`_cell_view`); a locked report shows nothing editable and refuses saves (409, Serbian). `mark_preliminary_done` (also Home Preliminarni = 1 via `GfiStore.save`, so `change_log` has it), `create_final_report` (copies every company value of the three tabs as shown, `Pb1Store.create_final`). Routes `POST .../pb1-report/preliminary-done`, `POST .../pb1-report/final`; `report` query on GET tab, PUT cell, PDF. API `Pb1Table`: `report`, `preliminary_done`, `final_created`, `locked`. Amount rounding is now half up (`Decimal`), as in the editor (round() gave 1000.55 for 1000.555).
+- **Frontend:** `Pb1ReportSwitch` (segmented pill switch with a sliding thumb, Final disabled until done, lock icon on a done Preliminary; "Mark as done" with an `AlertDialog`, flushes the queue first) and `Pb1CreateFinal` (card with "Create from preliminary"); `Pb1Page` keeps `?report=` across tabs, hides the actions while the final report doesn't exist; `usePb1(report)`; the autosave queue carries the report (`Pb1Target.report`, in the URL and the key; old queued changes = preliminary). The PDF button sends the report shown.
+- **PDF:** title "Preliminary / Final PB-1 report"; the running header and the file name name the report.
+- **Tests (one transaction, rolled back; real database unchanged: 0 PB-1 values, 0 states, 0 history rows):** 34/34 on FRIGOLAKTA and DAGOTTA 2025: default preliminary; final refused before done; done sets Home 1; preliminary locked (nothing editable, save 409); final locked until created; created once (second 409); final equals preliminary on all three tabs and results; a final change leaves the preliminary unchanged and changes the final results (separate math); back to the copied value stays stored, unmarked; both reports stored separately. PDFs build for both reports. `tsc` passes. **Not seen in the browser** (memory low, Chrome froze before).
+
+### Final report: Mark as done / Unlock (2026-11-17)
+- User agreed with the proposal: the final report is marked as done like the preliminary one (locked, Home "PB-1, PB-2" = 1, so "PB-1,PB-2 za rad" becomes 0), and can be unlocked again, the inverse (editable, Home "PB-1, PB-2" = 0).
+- **Migration 0018** (applied, `alembic check` clean): `pb1_report_state.final_done_by/at` with CHECKs (pair; only after created). `ReportState.final_done`; `Pb1Form.locked` also while the final report is done (save 409 "Konačni izveštaj je gotov i zaključan; otključajte ga za izmene."); `set_final_done` (Home via `_set_home_status`, generalized from the preliminary one); routes `final-done`, `final-unlock`; API `final_done`.
+- **Frontend:** `Pb1ReportSwitch` on Final: "Mark as done" (chart-3 tint) or, when done, "Unlock" (chart-1 tint, `LockOpen`), each with its own Serbian confirmation; lock icon on the Final option while done; the page reloads after each.
+- **Tests (rolled back):** 44/44 (also: done refused before created; done locks everything and sets Home PB-1, PB-2 = 1; save refused; unlock sets it to 0 and saving works again). The real database keeps the user's own state (2025, 1. OKTOBAR: preliminary done, final created). `tsc` passes. Not seen in the browser.
+- Submitting the report (Home "PB-1, PB-2 Predat"): a proposal was given to the user; nothing built.
+
+### Submitting the report, and the history of the steps (2026-11-17)
+User accepted the whole proposal; the submission keeps its date and time, and the consecutive steps are listed (proposal: a timeline). Whether Home's status columns stay editable by hand is left for later.
+- **Migration 0019** (applied, `alembic check` clean): `pb1_report_state.submitted_by/at` (CHECKs: pair; only after the final is done); new `pb1_report_event` (company_year, event CHECK, happened_at, happened_by), filled from the states already stored (the user's 1. OKTOBAR 2025: preliminary done, final created, final done). Migracija policy: not carried, deleted with the year.
+- **Backend:** every step writes an event (`_event` in `Pb1Store`); `set_submitted` (only a done final report; Home "PB-1, PB-2 Predat" 1 / 0), unlocking refused while submitted; `report_history` (newest first); routes `POST .../pb1-report/submitted`, `.../submission-withdrawn`, `GET .../pb1-report/history`; API `submitted_at`.
+- **Frontend:** on a done final report "Mark as submitted" (success tint, `Send`) next to "Unlock"; when submitted a green badge "Submitted · 17.11.2026. 14:32" and "Withdraw submission" (destructive outline, `Undo2`), Unlock hidden; each with a Serbian confirmation (the withdrawal with a warning). "History" button (right of the switch) opens a side panel (`Sheet`) with a vertical timeline: icon per step (coloured by kind), English label, date and time (dd.mm.yyyy. hh:mm) and user, newest at the top; reloaded after each step.
+- **PDF:** a submitted report has "Submitted dd.mm.yyyy. hh:mm" in its title line.
+- **Tests (rolled back):** 58/58 (also: submit refused before done; submitted sets Predat 1 and time, the table carries it, unlock refused; withdraw sets Predat 0, stays locked; unlock again; history of 8 steps in the right order, newest first). Real database: only the user's own state and its 3 events. `tsc` passes. Not seen in the browser.
+
+### Open / next tasks
+- No way back once the preliminary report is done (user's choice: locked, viewable). Setting Home Preliminarni back to 0 does not unlock it.
+
+## 2026-11-17: Session 48: Home view only; the status columns follow the PB-1 steps; GFI step
+
+User's decisions: nothing on Home is changed by hand any more (every year and company); the four status columns depend only on the button steps; GFI uradjen becomes a step of the same flow (proposal accepted: between the preliminary and the final report); existing values aligned with the PB-1 steps; Home view only and shaded.
+### Completed
+- **Flow:** preliminary done (Preliminarni) -> GFI done (GFI uradjen) -> final created -> final done (PB-1, PB-2) -> submitted (Predat); inverses: Reopen GFI (only before the final report exists), Unlock (not while submitted), Withdraw submission.
+- **Migration 0020** (applied; irreversible): `pb1_report_state.gfi_done_by/at` with CHECKs (pair; after the preliminary; final only after GFI); the existing final report (1. OKTOBAR 2025) got its GFI step at its creation time; event types `gfi_done` / `gfi_reopened` (+ backfilled event); every status value of every company year set from the steps, each change in `change_log` ('migration 0020'): 2025 Preliminarni 13, GFI uradjen 130, PB-1, PB-2 144, Predat 1 values 1 -> 0; now 2025 = 1 / 1 / 1 / 1 (only 1. OKTOBAR), 2026 all 0.
+- **Backend:** `edit_kind` returns None for the status columns (`PUT /cells` 409); `load_table` shows their current value (never an edit against the snapshot); `gfi_import` stores them as 0 (snapshot keeps the workbook), `--replace` ignores them and refuses while PB-1 report steps are stored; `set_gfi_done` + routes `gfi-done` / `gfi-reopen`; `create_final_report` needs GFI done; API `gfi_done`.
+- **Frontend:** Home view only, every data cell shaded (`shadeAll`), Serbian description; Edit Company Data: status columns read-only and shaded, description updated; `Pb1CreateFinal` shows the two steps (1. GFI: Mark GFI as done / Reopen GFI with confirmations; 2. Create from preliminary, disabled until GFI is done); History labels for the GFI events.
+- **Tests (rolled back):** 70/70 (GFI before final, reopen and again, reopen refused after the final exists; Home 2025 / 2026: no status cell editable or marked changed, manual edit refused 409; the whole earlier flow). Migration policies ok; real database: the user's state (1 report state, 7 events), nothing from the tests. Seen in the browser: Home 2026 with the description and shaded cells (`bg-muted/60`, as the formula columns before; light). `tsc` passes.
+- Then (user): no hover box on Home: Home cells don't react to the mouse (`viewOnly` in `CompanyTable`: no enlarged preview, highlight or tooltip). As the preview was the only way to read a cut value, long values on Home now wrap ("NEMANJA STAJIĆ PR SMASH CRIB BURGERS" was the one cut). Checked in the browser (2026): 165 rows, no preview box, nothing cut. Edit Company Data unchanged (user: it is right as it is).
+
+## 2026-11-17: Session 49: App mark and browser tab icon
+
+- User: the browser tab showed the default globe (no favicon); wanted the menu icon there, and a nicer one. Options shown on a temporary preview page (9 lucide icons; removed afterwards); user chose **Landmark** (4) with colors.
+- `AppLogo` component: Landmark on a blue tile (`--brand`), white columns (`--brand-foreground`), golden roof (`--brand-accent`); tokens added for light and dark. Replaces the dark Workflow tile in the sidebar and on Login. `public/favicon.svg` (same mark) linked in `index.html`.
+- Seen in the browser: the sidebar mark; favicon.svg served and linked (the automated tab shows the extension's own icon, so the tab icon itself is for the user to see). `tsc` passes.
+- PB-1 page: the values badge next to the save status ("Imported values" / "N values entered" / "No PB-1 values yet") removed (user: no real purpose; it was shown only on the preliminary report since the two reports exist). The API still sends `has_values` / `entered` (internal). `tsc` passes.
+
+## 2026-11-17: Session 50: Search field in the header
+
+- User: a search bar fixed at the top right, in sight even when scrolled to the bottom; PB-1 tab 1 (the other two tabs are clear enough), and also Home and Edit Company Data.
+- `HeaderSearch` (portal into a slot of the sticky `Header`, provider in `AuthenticatedLayout`); `src/lib/search.ts` (lower case, no diacritics, đ = dj).
+- Home / Edit Company Data (`GfiTableView` -> `CompanyTable` `query`): filters companies by NAZIV, PIB, REFERENT, office; # keeps the list position; subtitle "x of 165 companies"; "Nijedna firma ne odgovara pretrazi." when none.
+- PB-1 Poreski bilans (`Pb1Page` -> `Pb1Table` `marks`, `data-pb1-row`): rows whose #, Opis or Konto match are marked (`bg-brand-accent/15`, the focused one `/45`) and the focused one is scrolled into the middle; counter "2 / 17", Enter / Shift+Enter, arrow buttons, Escape / X clears.
+- Seen in the browser: FRIGOLAKTA 2025 "porez" 17 matches, stepping works, the field stays at the top right with the page scrolled; Home 2026 "frigo" -> 2 of 165 (rows 118, 136). `tsc` passes. PDF: not concerned.
+
+## 2026-11-17: Session 51: Poreski bilans strip above the table
+
+- User: arrange everything above the main table more nicely, without wrapping; the strip stays (not taller) and moves with the page as a whole; the blurred page header must not cover it when scrolling.
+- `Pb1Table`: the strip (head rows | framed section with the closing rows and the two results) is one `flex-nowrap` line over the full width, sticky under the page header (`sm:sticky sm:top-16 bg-background`); the section takes the free width; `ResultTile` compact (label + badge left, amount + note right, `whitespace-nowrap`), the two stacked within the strip's height. The form table: `max-h-[calc(100svh-18rem)]` (was 16rem) so at the bottom of the page its top stays below the strip.
+- Seen in the browser (FRIGOLAKTA 2025): top of the page and scrolled down: the strip is wholly visible under the header, the table and its header row below it, nothing wraps. `tsc` passes. PDF: not concerned (page layout only).
+- Then (user: the scrolling is right): the two result tiles side by side, each a normal-width tile (`w-64`: label and badge on top, larger amount below, the note under it), spaced evenly over the free width (`justify-evenly gap-6`); and the report switch line now holds Save changes / Generate PDF report too (after a separator; `actions` prop of `Pb1ReportSwitch`), History at the right end; one line less above the tabs. Seen in the browser (FRIGOLAKTA 2025). `tsc` passes.
+
+## 2026-11-17: Session 52: Prekoracenje = Ostvareni - Priznati
+
+User's rules: Prekoracenje is everywhere Ostvareni troskovi - Priznati troskovi (e.g. 10k recognized, 50k actual -> 40k, red); answers: lines 22–25 get their columns swapped (Recommended), a negative difference is shown (not 0), and the rule applies in every line even where only one column is used. Then: lines 22–25 limits are 5 %, 5 %, 0,1 %, 0,5 % of total revenue (already so: rate × Klasa 6, rates from the global comments).
+### Completed
+- **Formulas:** E = D - C for the 69 form lines (`OVERRUN_ROWS`, `ADDED_FORMULAS`, not compared with the workbook); C30–C33 = D3 × F30–F33 (limits, were D30–D33); C74 adds only positive E30–E33 (`IF(E>0,E,0)`), Preliminarni G3 = positive E33, so the tax base is unchanged. The workbook formula check still passes (81 computed cells on Poreski bilans).
+- **Migration 0021** (applied; reversible by swapping again): C and D of rows 30–33 swapped in `pb1_source_cell` (every snapshot), `pb1_company_edit` (both reports) and `pb1_template_edit`. FRIGOLAKTA 2025 row 33: C 8.891,50 (limit), D 256.468,24 (entered), E 247.576,74; base -782.907,45 and results unchanged; G3 247.576,74.
+- **Red:** `Pb1Column.overrun` (page: `FieldCell` red for a positive value in that column, follows the recomputed formulas at once) and `Pb1CellOut.red` (PDF). Negative overruns red as every negative number.
+- **Tests (rolled back):** 6/6 on DAGOTTA (limits 50.000 / 50.000 / 1.000 / 5.000 for Klasa 6 = 1.000.000; E30 = -50.000; reprezentacija 20.000 -> E33 15.000 and the base +15.000 only; G3 15.000; a plain line 700 - 1.000 = -300). Seen in the browser (FRIGOLAKTA). PDF builds. `tsc` passes.
+- Note: lines whose C is a formula total (e.g. 69 Oporeziva dobit, row 74) now show E = -C as well (the rule applies everywhere, user's answer).
+
+## 2026-11-17: Session 53: Green negative overruns; Poreska osnovica = sum of overruns; box heading
+
+- **Green:** a negative Prekoracenje (under the limit) is green, a positive one red (page `FieldCell` from the column flag; PDF `green` / `red` cell flags).
+- **Poreska osnovica** (user: the sum of all overruns along the lines; tax 15 % and monthly advance as before). Answers: the total lines 57, 59, 62 are left out (their E dropped, not stored: migration 0022) and only positive overruns count. C86 = sum of `IF(E>0,E,0)` over `OVERRUN_ROWS` (66 lines). Formulas depending on added / changed ones are no longer compared with the workbook (`unverified_formulas`: C74, C77, C86–C88, J/M86–88, and the Uporedo / Preliminarni cells fed by G3); the check passes (Poreski bilans 78 computed cells).
+- FRIGOLAKTA 2025: base 352.676,28 = lines 20 and 21 (amortization, 52.549,77 each: only Ostvareni filled) + line 25 reprezentacija 247.576,74; Porez 15 % 52.901,44; Mesecna akontacija 4.408,45; tax result now Dobitak (was the loss -782.907,45 from C77 + C80). Pointed out to the user: line 21 (tax amortization) is a deduction in the official logic, here it adds.
+- **Box heading:** user: the first row of the box is a heading. "V. Poreska osnovica" has no value any more (C85 dropped, `AmountFix(85)` removed; migration 0023, the snapshot cell was empty, no edits). The PDF follows (no tile for it).
+- Not changed: Uporedo and Preliminarni rezultat keep their own base formulas.
+- Seen in the browser (FRIGOLAKTA). PDF builds. `tsc` passes.
+- Then (user): the box heading "V. Poreska osnovica" is one cell over the box width (no inner border line) and darker than the other rows (`bg-foreground/10`; `SummaryBox`: a row without any amount or editable field). Seen in the browser. `tsc` passes.
+- Then (user): the heading reads "Poreska osnovica" without "V." (it doesn't fit the numbering A., B.): `CORRECTIONS` in `app/pb1_texts.py`.
+

@@ -4,13 +4,14 @@ Client-server web application for income tax reporting: **FastAPI** backend (Pyt
 
 ## Features
 
-- **Login** with server-side sessions (Log out from the header or sidebar menu).
-- **Reporting year selector.** The years come from the GFI workbook file names (`<year> GFI *.xlsx`).
+- **Login** with server-side sessions (Log out from the header or sidebar menu). With PostgreSQL, users and sessions are stored in the database, so a backend restart doesn't log anyone out.
+- **Reporting year selector.** The years in the database (imported or constructed on the Migration page).
 - **GFI company table** for the selected year (columns A–N of the workbook), shown with each cell's Excel number format (Serbian separators, `1.234,56`).
-- **Editing with autosave.** Plain numeric cells can be edited in place. Edits are saved (SQLite now, PostgreSQL once set up) and shown on top of the Excel values. The Excel workbooks are never modified. Formula and empty cells are read-only.
-- **Company Registry** (sidebar → Companies). All 165 companies with every GFI column. Besides the numeric fields, the company name, PIB, referent and office can be edited here. Changes show on Home too, and PB-1 links are kept.
-- **PB-1 form per company, with three tabs** (Poreski bilans, Uporedo, Preliminarni rezultat), from `<year> PB-1.xls`. Open them with the three buttons in the Actions column on Home. The amounts are shown only for the company the file belongs to (linked once and stored); every other company sees the empty form. Read-only.
-- Light, dark and system theme.
+- **Editing with autosave.** Plain numeric cells can be edited in place. Edits are saved in PostgreSQL and shown on top of the original values. The Excel workbooks are never modified. Formula and empty cells are read-only.
+- **Edit Company Data** (sidebar → Companies). All companies with the columns that are filled in (the formula columns are left out). The company name, PIB, referent and office are edited only here; the status columns can be edited here too, empty cells included. Changes show on Home too, and PB-1 links are kept.
+- **PB-1 form per company, with three tabs** (Poreski bilans, Uporedo, Preliminarni rezultat), imported from `<year> PB-1.xls`. Open them with the three buttons in the Actions column on Home. The amounts from the file are shown only for the company the file belongs to (linked once and stored); every other company sees the empty form. Amounts and template fields can be edited; formulas are computed. The comments beside Poreski bilans are global (every year and company) and are edited on the Global Settings page.
+- **Migration** (sidebar → Administration): construct the next year from the latest one (companies chosen in a dialog, with its PB-1 form), change the companies of a constructed year, or delete the latest constructed year (red button, with a confirmation).
+- Light and dark theme.
 
 ```
 backend/    FastAPI app (port 8000)
@@ -21,13 +22,14 @@ CLAUDE.md   Project rules and design guidelines
 
 ## Data files
 
-- GFI workbooks `<year> GFI *.xlsx` and PB-1 files `<year> PB-1.xls` are read from `GFI_DATA_DIR` (default: the project root). They are read-only.
-- GFI data is stored in **PostgreSQL** once it is set up (see below). Until then, the app reads the GFI workbook directly and stores edits in `backend/data/edits.db` (SQLite, `DATABASE_PATH`; git-ignored).
-- PB-1 is always read from the `.xls` file for now.
+- GFI workbooks `<year> GFI *.xlsx` and PB-1 files `<year> PB-1.xls` are in `GFI_DATA_DIR` (default: the project root). They are never written.
+- With **PostgreSQL** (see below) everything is in the database: GFI data, the PB-1 forms, all edits, comments and settings, users and sessions. The Excel files are read only once, by the imports (`app.gfi_import`, `app.pb1_import`); after that the app never opens them.
+- The app has no mode without the database: without `DATABASE_URL` the backend doesn't start. The Excel files can stay in the folder; the app doesn't need them (deleting them wouldn't affect it).
+- Everything the app remembers is in PostgreSQL (`DATABASE_URL` must point to a PostgreSQL database). The old SQLite store from before PostgreSQL was verified (all its data is in PostgreSQL) and deleted.
 
 ## Database (PostgreSQL)
 
-The app switches to PostgreSQL as soon as `DATABASE_URL` is set in `backend/.env`. Without it, it keeps using Excel + SQLite.
+The app needs PostgreSQL: `DATABASE_URL` in `backend/.env` is required.
 
 1. Install **PostgreSQL 18** (Windows installer from https://www.postgresql.org/download/windows/). Choose a password for the `postgres` superuser.
 2. Create a database and an app user (for example in **SQL Shell (psql)**, logged in as `postgres`):
@@ -57,11 +59,22 @@ The app switches to PostgreSQL as soon as `DATABASE_URL` is set in `backend/.env
    .venv\Scripts\python -m app.gfi_import 2025
    ```
 
-   The import keeps the company list (165 companies, up to DAGOTTA). It carries over all edits saved in SQLite, verifies every cell against the current table, and lists data issues such as missing or shared PIBs. If anything doesn't match, nothing is saved. The Excel file and `edits.db` are only read.
+   The import keeps the company list (165 companies, up to DAGOTTA). It verifies every cell against the workbook and lists data issues such as missing or shared PIBs. If anything doesn't match, nothing is saved. The Excel file is only read.
 
-6. Restart the backend. The log shows `GFI data source: PostgreSQL`.
+6. Import the year's PB-1 workbook the same way (after its GFI data):
 
-To import a year again later, use `--replace`. It refuses while any value has been changed in the database, so no edits are lost.
+   ```powershell
+   .venv\Scripts\python -m app.pb1_import 2025 --dry-run
+   .venv\Scripts\python -m app.pb1_import 2025
+   ```
+
+   It stores every cell of the form's three sheets (values, formats, fills, column widths) and fills the global comments for rows that have none. It then builds every company's PB-1 tables both ways (form from the file and from the database) and saves nothing unless they are all equal.
+
+7. Restart the backend. The log shows `GFI data source: PostgreSQL`.
+
+To import a year again later, use `--replace`. It refuses while any value has been changed in the database, so no edits are lost (`gfi_import` also refuses while PB-1 values of that year's companies are stored; `pb1_import` while any PB-1 edit is stored for a year using the form).
+
+Users: migration 0007 created the user `nikola` (same password as before) in `app_user`. Sessions are stored as SHA-256 hashes of the cookie token in `user_session`.
 
 ## Prerequisites
 

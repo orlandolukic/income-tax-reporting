@@ -6,7 +6,7 @@ import { useReportingYear } from "@/context/ReportingYearProvider";
 import { originalValue, useCompanyTable } from "@/hooks/use-company-table";
 
 /**
- * Data and editing for a GFI table page (Home, Company Registry): loads the table for the
+ * Data and editing for a GFI table page (Home, Edit Company Data): loads the table for the
  * selected reporting year and saves edits through the shared autosave queue. Every page
  * loads fresh data when opened, so changes made on one page show on the other.
  */
@@ -36,7 +36,7 @@ export function useGfiEditor() {
           for (const [column, value] of Object.entries(result.formulas ?? {})) {
             tableRef.current.setCell(result.row, column, { value });
           }
-          // Totals under the Home table follow too.
+          // Totals above the Home table follow too.
           if (result.stats) tableRef.current.setStats(result.stats);
         },
         onRejected: (edit) => {

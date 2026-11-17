@@ -4,6 +4,14 @@ import type { SaveState } from "@/hooks/use-cell-autosave";
 
 type Props = { status: SaveState; pendingCount: number; onRetry: () => void };
 
+/** "1 nesačuvana izmena je zadržana", "3 nesačuvane izmene su zadržane", "5 nesačuvanih izmena je zadržano". */
+function unsavedKept(n: number): string {
+  const tens = n % 100;
+  if (n % 10 === 1 && tens !== 11) return `${n} nesačuvana izmena je zadržana`;
+  if (n % 10 >= 2 && n % 10 <= 4 && (tens < 12 || tens > 14)) return `${n} nesačuvane izmene su zadržane`;
+  return `${n} nesačuvanih izmena je zadržano`;
+}
+
 /** Autosave indicator: Saving… / All changes saved / error with retry. */
 export function SaveStatus({ status, pendingCount, onRetry }: Props) {
   return (
@@ -11,16 +19,16 @@ export function SaveStatus({ status, pendingCount, onRetry }: Props) {
       {status.state === "saving" && (
         <span className="text-muted-foreground flex items-center gap-1.5">
           <Loader2 className="size-4 animate-spin" />
-          Saving…
+          Čuvanje…
         </span>
       )}
       {status.state === "saved" && (
         <span
           className="text-muted-foreground flex items-center gap-1.5"
-          title={`Saved at ${status.savedAt.toLocaleTimeString()}`}
+          title={`Sačuvano u ${status.savedAt.toLocaleTimeString()}`}
         >
           <CheckCircle2 className="size-4" />
-          All changes saved
+          Sve izmene su sačuvane
         </span>
       )}
       {status.state === "error" && (
@@ -29,7 +37,7 @@ export function SaveStatus({ status, pendingCount, onRetry }: Props) {
             <AlertCircle className="size-4" />
             {status.message}
             {pendingCount > 0 &&
-              ` ${pendingCount} unsaved change${pendingCount === 1 ? "" : "s"} kept${status.retrying ? ", retrying…" : "."}`}
+              ` ${unsavedKept(pendingCount)}${status.retrying ? ", novi pokušaj…" : "."}`}
           </span>
           {pendingCount > 0 && (
             <Button variant="outline" size="sm" onClick={onRetry}>

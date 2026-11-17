@@ -15,7 +15,7 @@ type AutosaveContextValue = ReturnType<typeof useCellAutosave> & {
 const AutosaveContext = createContext<AutosaveContextValue | null>(null);
 
 /**
- * One autosave queue for all logged-in pages (Home, Company Registry). Changes keep
+ * One autosave queue for all logged-in pages (Home, Edit Company Data). Changes keep
  * being sent while the user moves between pages, and unsaved changes are kept in
  * localStorage across reloads, logout and session expiry.
  */

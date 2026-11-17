@@ -1,10 +1,19 @@
 import { useCallback, useEffect, useRef, useState } from "react";
-import { CalendarPlus, Loader2, Users } from "lucide-react";
+import { CalendarPlus, Loader2, Trash2, Users } from "lucide-react";
 import { useNavigate } from "react-router";
 import { useAuth } from "@/auth/AuthContext";
 import { CompanySelectDialog } from "@/components/CompanySelectDialog";
 import { Main } from "@/components/layout/Main";
 import { Alert, AlertDescription } from "@/components/ui/alert";
+import {
+  AlertDialog,
+  AlertDialogCancel,
+  AlertDialogContent,
+  AlertDialogDescription,
+  AlertDialogFooter,
+  AlertDialogHeader,
+  AlertDialogTitle,
+} from "@/components/ui/alert-dialog";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
@@ -20,9 +29,11 @@ type YearInfo = {
   source: string;
   companies: number;
   pb1?: string | null; // the year's PB-1 form (workbook, or constructed with the year)
+  deletable?: boolean; // the latest year, constructed here: it can be deleted
 };
 type MigrationStatus = { years: YearInfo[]; next_year: number | null; source_year: number | null };
 type SelectionResult = { year: number; companies: number; added: number; restored: number; removed: number };
+type DeleteResult = { year: number; companies: number; pb1_values: number };
 
 // The dialog is open for: building the next year, or changing a constructed year's companies.
 type DialogState = { mode: "construct" | "edit"; year: number } | null;
@@ -37,7 +48,7 @@ async function send(url: string, method: "POST" | "PUT", companyIds: number[], o
     onUnauthorized();
     throw new Error("Sesija je istekla.");
   }
-  if (!res.ok) throw new Error((await res.json().catch(() => null))?.detail ?? `HTTP ${res.status}`);
+  if (!res.ok) throw new Error((await res.json().catch(() => null))?.detail ?? `Greška na serveru (HTTP ${res.status}).`);
   return (await res.json()) as SelectionResult;
 }
 
@@ -54,6 +65,10 @@ export default function MigrationPage() {
   const [error, setError] = useState<string | null>(null);
   const [dialog, setDialog] = useState<DialogState>(null);
   const [message, setMessage] = useState<string | null>(null);
+  // The year whose deletion is being confirmed.
+  const [toDelete, setToDelete] = useState<YearInfo | null>(null);
+  const [deleting, setDeleting] = useState(false);
+  const [deleteError, setDeleteError] = useState<string | null>(null);
   // Not a dependency of `load` (it is a new function on every render).
   const expiredRef = useRef(markSessionExpired);
   expiredRef.current = markSessionExpired;
@@ -66,7 +81,7 @@ export default function MigrationPage() {
           expiredRef.current();
           throw new Error("Sesija je istekla.");
         }
-        if (!res.ok) throw new Error((await res.json().catch(() => null))?.detail ?? `HTTP ${res.status}`);
+        if (!res.ok) throw new Error((await res.json().catch(() => null))?.detail ?? `Greška na serveru (HTTP ${res.status}).`);
         return res.json();
       })
       .then((data: MigrationStatus) => setStatus(data))
@@ -94,6 +109,31 @@ export default function MigrationPage() {
     load();
   };
 
+  const deleteYear = async () => {
+    if (!toDelete) return;
+    setDeleting(true);
+    setDeleteError(null);
+    try {
+      const res = await fetch(`/api/migration/years/${toDelete.year}`, { method: "DELETE" });
+      if (res.status === 401) {
+        markSessionExpired();
+        throw new Error("Sesija je istekla.");
+      }
+      if (!res.ok) throw new Error((await res.json().catch(() => null))?.detail ?? `Greška na serveru (HTTP ${res.status}).`);
+      const result = (await res.json()) as DeleteResult;
+      logger.warning(`Year ${result.year} deleted`, result);
+      setMessage(`Godina ${result.year} je obrisana (${result.companies} firmi, ${result.pb1_values} PB-1 vrednosti).`);
+      setToDelete(null);
+      reloadYears();
+      load();
+    } catch (err) {
+      logger.error("Failed to delete the year", err);
+      setDeleteError((err as Error).message);
+    } finally {
+      setDeleting(false);
+    }
+  };
+
   const openYear = (year: number) => {
     setSelectedYear(year);
     navigate("/");
@@ -103,7 +143,7 @@ export default function MigrationPage() {
   return (
     <Main>
       <div>
-        <h1 className="text-2xl font-bold tracking-tight">Migracija</h1>
+        <h1 className="text-2xl font-bold tracking-tight">Migration</h1>
         <p className="text-muted-foreground">
           Sledeća godina se pravi iz poslednje: prenose se naziv, PIB, referent i kancelarija firme, a statusne kolone
           počinju od 0. Pravi se i PB-1 obrazac (sva tri taba, kao u prethodnoj godini, sa nulama).
@@ -131,7 +171,7 @@ export default function MigrationPage() {
         {status && next && (
           <Card>
             <CardHeader>
-              <CardTitle>Sledeća godina: {next}</CardTitle>
+              <CardTitle>Next year: {next}</CardTitle>
               <CardDescription>
                 Pravi se iz {status.source_year}. Izaberite firme koje će {next} prikazivati.
               </CardDescription>
@@ -139,7 +179,7 @@ export default function MigrationPage() {
             <CardContent>
               <Button onClick={() => setDialog({ mode: "construct", year: next })}>
                 <CalendarPlus />
-                Konstruiši {next}…
+                Construct {next}…
               </Button>
             </CardContent>
           </Card>
@@ -148,8 +188,8 @@ export default function MigrationPage() {
         {status && (
           <Card>
             <CardHeader>
-              <CardTitle>Godine</CardTitle>
-              <CardDescription>Godine iz Excel fajlova i godine konstruisane ovde.</CardDescription>
+              <CardTitle>Years</CardTitle>
+              <CardDescription>Uvezene godine i godine napravljene ovde.</CardDescription>
             </CardHeader>
             <CardContent>
               <ul className="divide-y rounded-md border">
@@ -158,21 +198,34 @@ export default function MigrationPage() {
                     <div className="flex flex-wrap items-center gap-2">
                       <span className="font-semibold tabular-nums">{y.year}</span>
                       <Badge variant={y.origin === "constructed" ? "secondary" : "outline"}>
-                        {y.origin === "constructed" ? `konstruisana iz ${y.based_on_year}` : y.source}
+                        {y.origin === "constructed" ? `constructed from ${y.based_on_year}` : "imported"}
                       </Badge>
-                      <span className="text-muted-foreground text-sm">{y.companies} firmi</span>
-                      <span className="text-muted-foreground text-sm">· PB-1: {y.pb1 ?? "nema"}</span>
+                      <span className="text-muted-foreground text-sm">{y.companies} companies</span>
+                      <span className="text-muted-foreground text-sm">· {y.pb1 ? "PB-1 form" : "no PB-1 form"}</span>
                     </div>
                     <div className="flex flex-wrap gap-2">
                       {y.origin === "constructed" && (
                         <Button variant="outline" size="sm" onClick={() => setDialog({ mode: "edit", year: y.year })}>
                           <Users />
-                          Izmeni firme…
+                          Edit companies…
                         </Button>
                       )}
                       <Button variant="outline" size="sm" onClick={() => openYear(y.year)}>
-                        Otvori
+                        Open
                       </Button>
+                      {y.deletable && (
+                        <Button
+                          variant="destructive"
+                          size="sm"
+                          onClick={() => {
+                            setDeleteError(null);
+                            setToDelete(y);
+                          }}
+                        >
+                          <Trash2 />
+                          Delete…
+                        </Button>
+                      )}
                     </div>
                   </li>
                 ))}
@@ -182,17 +235,42 @@ export default function MigrationPage() {
         )}
       </div>
 
+      <AlertDialog open={toDelete !== null} onOpenChange={(open) => !open && !deleting && setToDelete(null)}>
+        <AlertDialogContent>
+          <AlertDialogHeader>
+            <AlertDialogTitle>Da li stvarno želite da obrišete {toDelete?.year}?</AlertDialogTitle>
+            <AlertDialogDescription>
+              Godina {toDelete?.year} (konstruisana iz {toDelete?.based_on_year}) briše se u potpunosti: {toDelete?.companies}{" "}
+              firmi sa svim vrednostima, njen PB-1 obrazac sa svim unetim iznosima i komentarima i istorija izmena te
+              godine. Ostale godine ostaju nepromenjene. Brisanje se ne može vratiti.
+            </AlertDialogDescription>
+          </AlertDialogHeader>
+          {deleteError && (
+            <Alert variant="destructive">
+              <AlertDescription>{deleteError}</AlertDescription>
+            </Alert>
+          )}
+          <AlertDialogFooter>
+            <AlertDialogCancel disabled={deleting}>Cancel</AlertDialogCancel>
+            <Button variant="destructive" onClick={deleteYear} disabled={deleting}>
+              {deleting ? <Loader2 className="animate-spin" /> : <Trash2 />}
+              Delete {toDelete?.year}
+            </Button>
+          </AlertDialogFooter>
+        </AlertDialogContent>
+      </AlertDialog>
+
       {dialog && (
         <CompanySelectDialog
           open
           year={dialog.year}
-          title={dialog.mode === "construct" ? `Firme za ${dialog.year}` : `Firme u ${dialog.year}`}
+          title={dialog.mode === "construct" ? `Companies for ${dialog.year}` : `Companies in ${dialog.year}`}
           description={
             dialog.mode === "construct"
               ? `Štiklirane firme se prenose iz ${status?.source_year} u ${dialog.year} (naziv, PIB, referent, kancelarija; statusi 0).`
               : `Štiklirane firme se prikazuju u ${dialog.year}. Sklonjena firma zadržava svoje podatke ako se vrati.`
           }
-          confirmLabel={dialog.mode === "construct" ? `Konstruiši ${dialog.year}` : "Sačuvaj izbor"}
+          confirmLabel={dialog.mode === "construct" ? `Construct ${dialog.year}` : "Save selection"}
           onOpenChange={(open) => !open && setDialog(null)}
           onConfirm={onConfirm}
           onUnauthorized={markSessionExpired}

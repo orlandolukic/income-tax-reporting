@@ -11,12 +11,17 @@
 - referent / office: lookup tables (exact text from the workbook, no merging).
 - import_issue: problems found while importing (missing / shared / non-9-digit PIB, ...).
 - change_log: every edit, with old and new value (number or text), user and time.
-- pb1_link: which company_year a PB-1 file belongs to (PB-1 data itself is still read from Excel).
+- pb1_link: which company_year a PB-1 file's amounts belong to.
+- PB-1 (see the section below): the imported PB-1 workbook (pb1_sheet, pb1_sheet_column,
+  pb1_source_cell), edits shared by every company (pb1_template_edit), each company's own
+  values (pb1_company_edit) and the global comments (pb1_comment).
+- app_user / user_session: logins.
 
 Company identity is company.id / company_year.id. Editing a company's name or PIB
 changes the row in place, so the identity and its links stay the same.
 
-PB-1, users and sessions are not stored here yet.
+With DATABASE_URL set, everything the app shows or changes is in these tables; the Excel
+files are read only by the one-time imports (app.gfi_import, app.pb1_import).
 """
 
 from datetime import datetime
@@ -29,6 +34,7 @@ from sqlalchemy import (
     CheckConstraint,
     DateTime,
     ForeignKey,
+    ForeignKeyConstraint,
     Integer,
     LargeBinary,
     MetaData,
@@ -40,15 +46,17 @@ from sqlalchemy import (
 )
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship
 
-# BIGINT on PostgreSQL. INTEGER on SQLite (used only for local tests) so ids auto-increment.
-BigId = BigInteger().with_variant(Integer(), "sqlite")
+BigId = BigInteger()
 
 # Numeric GFI status values entered by users, in table order.
-NUMERIC_FIELDS = ("kom", "preliminarni", "gfi_uradjen", "pb", "pb_predat")
-# Columns that are always computed (read-only, not stored): field -> (minuend, subtrahend).
-# An empty value counts as 0.
-FORMULA_FIELDS = {
-    "gfi_za_rad": ("kom", "gfi_uradjen"),  # GFI ZA RAD = kom - GFI uradjen
+NUMERIC_FIELDS = ("preliminarni", "gfi_uradjen", "pb", "pb_predat")
+# kom (the workbook's "kom" column) is not stored: it is 1 for every company and every year
+# (user's rule, 2026-11-14). It stays a constant in the formula and the statistics.
+KOM = 1
+# Columns that are always computed (read-only, not stored): field -> (minuend, subtrahend);
+# an operand is a field or a constant. An empty value counts as 0.
+FORMULA_FIELDS: dict[str, tuple[str | int, str]] = {
+    "gfi_za_rad": (KOM, "gfi_uradjen"),  # GFI ZA RAD = kom (1) - GFI uradjen
     "pb_za_rad": ("pb", "pb_predat"),  # PB-1,PB-2 za rad = PB-1, PB-2 - PB-1, PB-2 Predat
 }
 
@@ -166,6 +174,8 @@ class CompanyYear(Base):
     __table_args__ = (
         UniqueConstraint("year", "source_row"),
         UniqueConstraint("year", "company_id"),
+        # Status columns are never empty and hold only 0 or 1 (user's rule, 2026-11-14).
+        *(CheckConstraint(f"{field} IN (0, 1)", name=f"{field}_0_or_1") for field in NUMERIC_FIELDS),
     )
 
     id: Mapped[int] = mapped_column(BigId, primary_key=True)
@@ -176,11 +186,11 @@ class CompanyYear(Base):
     name: Mapped[str] = mapped_column(Text)  # NAZIV as written in this year's workbook
     referent_id: Mapped[int | None] = mapped_column(ForeignKey("referent.id"))
     office_id: Mapped[int | None] = mapped_column(ForeignKey("office.id"))
-    kom: Mapped[Decimal | None] = mapped_column(Numeric)
-    preliminarni: Mapped[Decimal | None] = mapped_column(Numeric)
-    gfi_uradjen: Mapped[Decimal | None] = mapped_column(Numeric)
-    pb: Mapped[Decimal | None] = mapped_column(Numeric)
-    pb_predat: Mapped[Decimal | None] = mapped_column(Numeric)
+    # Status columns: 0 or 1, never empty (an empty cell of a workbook is imported as 0).
+    preliminarni: Mapped[Decimal] = mapped_column(Numeric)
+    gfi_uradjen: Mapped[Decimal] = mapped_column(Numeric)
+    pb: Mapped[Decimal] = mapped_column(Numeric)
+    pb_predat: Mapped[Decimal] = mapped_column(Numeric)
     # GFI ZA RAD and PB-1,PB-2 za rad are not stored: they are computed (FORMULA_FIELDS).
     updated_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     updated_by: Mapped[str | None] = mapped_column(Text)
@@ -206,6 +216,244 @@ class Pb1Link(Base):
     company_year_id: Mapped[int] = mapped_column(ForeignKey("company_year.id", ondelete="CASCADE"), index=True)
     linked_by: Mapped[str] = mapped_column(Text)
     linked_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+
+
+# --- PB-1 -----------------------------------------------------------------------------------
+# The PB-1 workbook of a year ("<year> PB-1.xls") is imported once (app.pb1_import) as a
+# read-only snapshot of its sheets: a source_file of kind 'pb1' (origin 'workbook') with
+# pb1_sheet / pb1_sheet_column / pb1_source_cell. A constructed year's form is a 'pb1'
+# source_file of origin 'constructed' (based_on_year) without cells: it uses the form of the
+# year it was built from. Edits and settings are stored per year; amounts and comments of a
+# company per company_year.
+
+PB1_TAB_KEYS = ("poreski-bilans", "uporedo", "preliminarni")
+_TAB_CHECK = "tab IN ('poreski-bilans', 'uporedo', 'preliminarni')"
+
+
+class Pb1SheetRow(Base):
+    """A sheet of an imported PB-1 workbook: one per tab of the form."""
+
+    __tablename__ = "pb1_sheet"
+    __table_args__ = (CheckConstraint(_TAB_CHECK, name="tab"),)
+
+    source_file_id: Mapped[int] = mapped_column(ForeignKey("source_file.id", ondelete="CASCADE"), primary_key=True)
+    tab: Mapped[str] = mapped_column(String(20), primary_key=True)
+    position: Mapped[int] = mapped_column(SmallInteger)  # sheet order in the workbook (0-based)
+    name: Mapped[str] = mapped_column(Text)  # Excel sheet name, e.g. "Uporedo 2025 i 2024"
+    nrows: Mapped[int] = mapped_column(Integer)  # used range of the sheet
+    ncols: Mapped[int] = mapped_column(Integer)
+
+
+class Pb1SheetColumn(Base):
+    """Column width of a PB-1 sheet, as set in Excel (columns without a width are left out)."""
+
+    __tablename__ = "pb1_sheet_column"
+    __table_args__ = (
+        ForeignKeyConstraint(
+            ["source_file_id", "tab"], ["pb1_sheet.source_file_id", "pb1_sheet.tab"], ondelete="CASCADE"
+        ),
+    )
+
+    source_file_id: Mapped[int] = mapped_column(BigId, primary_key=True)
+    tab: Mapped[str] = mapped_column(String(20), primary_key=True)
+    col: Mapped[str] = mapped_column(String(3), primary_key=True)  # Excel column letter
+    width: Mapped[int] = mapped_column(Integer)  # 1/256 of a character, as in the file
+
+
+class Pb1SourceCell(Base):
+    """A cell of a PB-1 sheet as stored in the file (read-only): its value (formula cells: Excel's
+    last result), number format, bold font and fill color. Empty, unformatted cells are left out."""
+
+    __tablename__ = "pb1_source_cell"
+    __table_args__ = (
+        ForeignKeyConstraint(
+            ["source_file_id", "tab"], ["pb1_sheet.source_file_id", "pb1_sheet.tab"], ondelete="CASCADE"
+        ),
+        CheckConstraint("kind IN ('empty', 'text', 'number', 'bool', 'error')", name="kind"),
+        CheckConstraint(
+            "(kind = 'empty' AND value_number IS NULL AND value_text IS NULL AND value_bool IS NULL)"
+            " OR (kind = 'number' AND value_number IS NOT NULL AND value_text IS NULL AND value_bool IS NULL)"
+            " OR (kind IN ('text', 'error') AND value_text IS NOT NULL AND value_number IS NULL AND value_bool IS NULL)"
+            " OR (kind = 'bool' AND value_bool IS NOT NULL AND value_number IS NULL AND value_text IS NULL)",
+            name="value_of_kind",
+        ),
+    )
+
+    source_file_id: Mapped[int] = mapped_column(BigId, primary_key=True)
+    tab: Mapped[str] = mapped_column(String(20), primary_key=True)
+    row: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=False)  # Excel row number
+    col: Mapped[str] = mapped_column(String(3), primary_key=True)  # Excel column letter
+    kind: Mapped[str] = mapped_column(String(6))
+    value_number: Mapped[Decimal | None] = mapped_column(Numeric)
+    value_text: Mapped[str | None] = mapped_column(Text)  # text, or an error such as "#DIV/0!"
+    value_bool: Mapped[bool | None] = mapped_column(Boolean)
+    number_format: Mapped[str] = mapped_column(Text, default="General")
+    bold: Mapped[bool] = mapped_column(Boolean, default=False)
+    fill: Mapped[str | None] = mapped_column(String(7))  # "#rrggbb"
+
+
+class _Pb1Value:
+    """Value columns of a PB-1 edit: the value and the value shown before the first edit
+    (a number or a text; both NULL = empty)."""
+
+    value_number: Mapped[Decimal | None] = mapped_column(Numeric)
+    value_text: Mapped[str | None] = mapped_column(Text)
+    original_number: Mapped[Decimal | None] = mapped_column(Numeric)
+    original_text: Mapped[str | None] = mapped_column(Text)
+    updated_by: Mapped[str] = mapped_column(Text)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+
+
+class Pb1TemplateEdit(_Pb1Value, Base):
+    """A change of the year's PB-1 form shared by every company (a template text, konto, ...)."""
+
+    __tablename__ = "pb1_template_edit"
+    __table_args__ = (CheckConstraint(_TAB_CHECK, name="tab"),)
+
+    year: Mapped[int] = mapped_column(ForeignKey("reporting_year.year"), primary_key=True)
+    tab: Mapped[str] = mapped_column(String(20), primary_key=True)
+    row: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=False)  # Excel row of the form
+    col: Mapped[str] = mapped_column(String(3), primary_key=True)
+
+
+# Every company's PB-1 has two separate reports (user, 2026-11-17): the preliminary one and the
+# final one, each with its own values and calculations.
+PB1_REPORTS = ("preliminary", "final")
+_REPORT_CHECK = "report IN ('preliminary', 'final')"
+
+
+class Pb1CompanyEdit(_Pb1Value, Base):
+    """A company's own PB-1 value in one of its reports: an amount or its months in business.
+    A final report's value is stored only where it differs from the (locked) preliminary one."""
+
+    __tablename__ = "pb1_company_edit"
+    __table_args__ = (CheckConstraint(_TAB_CHECK, name="tab"), CheckConstraint(_REPORT_CHECK, name="report"))
+
+    # RESTRICT: a company year with PB-1 values can't be deleted (e.g. by a GFI re-import).
+    company_year_id: Mapped[int] = mapped_column(
+        ForeignKey("company_year.id", ondelete="RESTRICT"), primary_key=True
+    )
+    report: Mapped[str] = mapped_column(String(12), primary_key=True, server_default="preliminary")
+    tab: Mapped[str] = mapped_column(String(20), primary_key=True)
+    row: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=False)
+    col: Mapped[str] = mapped_column(String(3), primary_key=True)
+
+
+class Pb1ReportState(Base):
+    """Where a company year's PB-1 reports stand: the preliminary report marked as done (then
+    locked, still viewable) and the final report created from it (user, 2026-11-17). No row:
+    the preliminary report is being worked on."""
+
+    __tablename__ = "pb1_report_state"
+    __table_args__ = (
+        CheckConstraint("(preliminary_done_at IS NULL) = (preliminary_done_by IS NULL)", name="done_pair"),
+        CheckConstraint("(final_created_at IS NULL) = (final_created_by IS NULL)", name="final_pair"),
+        # The final report is made only from a preliminary report marked as done.
+        CheckConstraint("final_created_at IS NULL OR preliminary_done_at IS NOT NULL", name="final_after_done"),
+        CheckConstraint("(gfi_done_at IS NULL) = (gfi_done_by IS NULL)", name="gfi_done_pair"),
+        # GFI is marked as done after the preliminary report, and before the final one is made.
+        CheckConstraint("gfi_done_at IS NULL OR preliminary_done_at IS NOT NULL", name="gfi_after_preliminary"),
+        CheckConstraint("final_created_at IS NULL OR gfi_done_at IS NOT NULL", name="final_after_gfi"),
+        CheckConstraint("(final_done_at IS NULL) = (final_done_by IS NULL)", name="final_done_pair"),
+        # Only a created final report can be marked as done.
+        CheckConstraint("final_done_at IS NULL OR final_created_at IS NOT NULL", name="final_done_after_created"),
+        CheckConstraint("(submitted_at IS NULL) = (submitted_by IS NULL)", name="submitted_pair"),
+        # Only a final report marked as done can be submitted.
+        CheckConstraint("submitted_at IS NULL OR final_done_at IS NOT NULL", name="submitted_after_done"),
+    )
+
+    company_year_id: Mapped[int] = mapped_column(
+        ForeignKey("company_year.id", ondelete="RESTRICT"), primary_key=True
+    )
+    preliminary_done_by: Mapped[str | None] = mapped_column(Text)
+    preliminary_done_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    # GFI (the annual financial statements) done: Home "GFI uradjen" = 1; the final report is
+    # made on it. Reopening clears it (only before the final report is created).
+    gfi_done_by: Mapped[str | None] = mapped_column(Text)
+    gfi_done_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    final_created_by: Mapped[str | None] = mapped_column(Text)
+    final_created_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    # The final report marked as done (locked); unlocking clears it (user, 2026-11-17).
+    final_done_by: Mapped[str | None] = mapped_column(Text)
+    final_done_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    # The report submitted (Home "PB-1, PB-2 Predat" = 1); withdrawing clears it. Every step is
+    # also kept in pb1_report_event.
+    submitted_by: Mapped[str | None] = mapped_column(Text)
+    submitted_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+
+
+# The steps of a company year's PB-1 reports, in pb1_report_event (user, 2026-11-17).
+PB1_REPORT_EVENTS = (
+    "preliminary_done", "gfi_done", "gfi_reopened", "final_created", "final_done", "final_unlocked", "submitted",
+    "submission_withdrawn",
+)
+
+
+class Pb1ReportEvent(Base):
+    """One step of a company year's PB-1 reports, with its date, time and user: the history of
+    the consecutive steps (marked as done, created, unlocked, submitted, withdrawn)."""
+
+    __tablename__ = "pb1_report_event"
+    __table_args__ = (
+        CheckConstraint("event IN (" + ", ".join(f"'{e}'" for e in PB1_REPORT_EVENTS) + ")", name="event"),
+    )
+
+    id: Mapped[int] = mapped_column(BigId, primary_key=True)
+    company_year_id: Mapped[int] = mapped_column(ForeignKey("company_year.id", ondelete="RESTRICT"), index=True)
+    event: Mapped[str] = mapped_column(String(24))
+    happened_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+    happened_by: Mapped[str] = mapped_column(Text)
+
+
+COMMENT_TEXT_CHECK = r"value_text IS NULL OR value_text !~ '^\s*-?\s*$'"
+
+
+class Pb1Comment(Base):
+    """Global settings: the comment of a PB-1 form row ("Komentar, stopa, konto"), one for every
+    year and every company (user's rule, 2026-11-15: the comments are rules for the form's
+    sections; no year or company comments). Edited only on the Global Settings page."""
+
+    __tablename__ = "pb1_comment"
+    __table_args__ = (
+        CheckConstraint(_TAB_CHECK, name="tab"),
+        # A comment always has a value: a number (a rate) or a text, not both.
+        CheckConstraint("(value_number IS NULL) <> (value_text IS NULL)", name="one_value"),
+        # A text comment is never only spaces or "-" (that is no comment).
+        CheckConstraint(COMMENT_TEXT_CHECK, name="text_not_blank"),
+    )
+
+    tab: Mapped[str] = mapped_column(String(20), primary_key=True)
+    row: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=False)  # Excel row of the form
+    value_number: Mapped[Decimal | None] = mapped_column(Numeric)  # a rate, e.g. 0.05
+    value_text: Mapped[str | None] = mapped_column(Text)  # a comment or konto numbers
+    # "workbook" (filled by the PB-1 import) or "app" (added on Global Settings)
+    source: Mapped[str] = mapped_column(Text)
+    updated_by: Mapped[str] = mapped_column(Text)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+
+
+# --- Users and sessions -------------------------------------------------------------------
+
+
+class AppUser(Base):
+    """A user who can log in. Only the password hash is stored (app.security)."""
+
+    __tablename__ = "app_user"
+
+    username: Mapped[str] = mapped_column(Text, primary_key=True)
+    password_hash: Mapped[str] = mapped_column(Text)
+    active: Mapped[bool] = mapped_column(Boolean, default=True, server_default=true())
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+
+
+class UserSession(Base):
+    """A login session. Only the SHA-256 of the cookie token is stored."""
+
+    __tablename__ = "user_session"
+
+    token_hash: Mapped[bytes] = mapped_column(LargeBinary, primary_key=True)
+    username: Mapped[str] = mapped_column(ForeignKey("app_user.username", ondelete="CASCADE"), index=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
 
 
 class ImportIssue(Base):

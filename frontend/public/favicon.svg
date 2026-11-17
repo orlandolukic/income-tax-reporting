@@ -1,0 +1,8 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 32 32">
+  <!-- The app's mark (src/components/AppLogo.tsx): Landmark on a blue tile, golden roof. -->
+  <rect width="32" height="32" rx="7" fill="#2563eb"/>
+  <g transform="translate(3.5 3.5) scale(1.04)" fill="none" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round">
+    <path d="M11.119 2.205a2 2 0 0 1 1.762 0l7.84 3.846A.5.5 0 0 1 20.5 7h-17a.5.5 0 0 1-.22-.949z" fill="#fbbf24" stroke="#fbbf24"/>
+    <path d="M6 18v-7M10 18v-7M14 18v-7M18 18v-7M3 22h18" stroke="#ffffff"/>
+  </g>
+</svg>

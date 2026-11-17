@@ -2,12 +2,13 @@
 
 The registry is every company of the database (`company`), each with its details from its most
 recent year. The next year (latest year + 1) is built in the app ("constructed"), not imported
-from a workbook: it gets the latest year's columns (headers, formats), and for each selected
-company a `company_year` with the company's identity (`company`) and only its details carried
-over: NAZIV, PIB, REFERENT and the office, as they are now (edits included). The status
-columns (kom, Preliminarni, GFI uradjen, PB-1, PB-2, Predat) start at 0; the formula columns
-(GFI ZA RAD, PB-1,PB-2 za rad) are computed as in every year. The table is then shown like any
-year (Home, Company Registry).
+from a workbook. **It must behave exactly like the year it is built from** (user's rule): it is
+a copy of that year (columns, each company's original cells with their kinds, formats and
+formula flags, the PB-1 form and its settings) with only the agreed changes applied: company
+details (NAZIV, PIB, REFERENT, office) as they are now (edits included); status columns that
+hold a number start at 0 (empty ones stay empty); company values and PB-1 amounts are not
+carried. Anything added to the app later must be carried the same way (YEAR_TABLES below; the
+backend doesn't start while a table has no policy). The table is then shown like any year.
 
 The year's PB-1 form is constructed with it (ensure_pb1_form): a 'pb1' source_file of origin
 "constructed" pointing to the year it was built from, so the year has the same three PB-1 tabs
@@ -16,8 +17,12 @@ The year's PB-1 form is constructed with it (ensure_pb1_form): a 'pb1' source_fi
 The companies of a constructed year can be changed later: a deselected company is hidden
 (`company_year.active`), not deleted, so its values are back when it is selected again.
 
-PostgreSQL only (the Excel + SQLite mode has no registry). construct_year and
-set_year_companies are the services; the API endpoints only call them.
+The latest year, if it was constructed here, can be deleted completely (delete_year): a wrong
+construction is undone. Only the latest one (no other year is built from it); a year imported
+from a workbook is never deleted here. Nothing of the year is left behind (its change_log history
+included) and nothing of the other years is changed.
+
+construct_year and set_year_companies are the services; the API endpoints only call them.
 """
 
 from datetime import datetime, timezone
@@ -25,32 +30,80 @@ from decimal import Decimal
 
 from fastapi import APIRouter, Depends, HTTPException, status
 from pydantic import BaseModel
-from sqlalchemy import func, select
+from sqlalchemy import delete, func, select
 from sqlalchemy.orm import Session, joinedload
 
 from app.auth import require_user
-from app.db import database_enabled, session_scope
+from app.db import session_scope
 from app.logging_config import get_logger
 from app.models import (
     FORMULA_FIELDS,
     NUMERIC_FIELDS,
+    ChangeLog,
     Company,
     CompanyYear,
     GfiColumn,
+    Office,
+    Pb1CompanyEdit,
+    Pb1ReportEvent,
+    Pb1ReportState,
+    Pb1Link,
+    Pb1TemplateEdit,
+    Referent,
     ReportingYear,
     SourceFile,
 )
 from app.models import SourceCell as SourceCellRow
-from app import edits_store
-from app.pb1 import comment_defaults, pb1_template
-from app.pb1_workbook import PB1_TABS, find_pb1_workbook, load_pb1_workbook
-from app.reporting_years import get_data_dir
+from app.gfi_store import text_of
+from app.pb1_store import copy_form_settings, form_source
+from app.pb1_workbook import PB1_TABS
 
 logger = get_logger(__name__)
 
 router = APIRouter(prefix="/api/migration", tags=["migration"])
 
 ZERO = Decimal(0)
+
+# What constructing a year (construct_year / set_year_companies / ensure_pb1_form) and deleting
+# the latest constructed year (delete_year) do with each table. Every table of the database must
+# be listed here or in GLOBAL_TABLES: check_table_policies() refuses to start the backend
+# otherwise, so a table added later can't be forgotten by the Migracija (user's rule: a new
+# year is built the way the current state is, and deleting it leaves nothing behind).
+YEAR_TABLES: dict[str, str] = {
+    "reporting_year": "construct: the new year | delete: removed",
+    "source_file": "construct: a 'constructed' gfi and pb1 source (based_on_year) | delete: removed",
+    "gfi_column": "construct: copied from the source year | delete: removed (cascade)",
+    "source_cell": "construct: each company's source cells copied, statuses holding a number set to 0 (_copy_company) | delete: removed (cascade)",
+    "company_year": "construct: per selected company, details carried, statuses as in source_cell | delete: removed (cascade)",
+    "import_issue": "construct: not carried (workbook import only) | delete: removed (cascade)",
+    "change_log": "construct: not carried (history of the source year) | delete: the year's rows removed",
+    "pb1_link": "construct: not carried (the file's amounts belong to the workbook year) | delete: removed",
+    "pb1_sheet": "construct: not copied, the form is shared from the workbook year (form_source) | delete: only constructed sources, no rows",
+    "pb1_sheet_column": "construct: not copied (as pb1_sheet) | delete: none",
+    "pb1_source_cell": "construct: not copied (as pb1_sheet) | delete: none",
+    "pb1_template_edit": "construct: copied (form-level settings, copy_form_settings) | delete: removed",
+    "pb1_company_edit": "construct: not carried (company values of both reports start empty) | delete: removed",
+    "pb1_report_state": "construct: not carried (a new year starts with the preliminary report) | delete: removed",
+    "pb1_report_event": "construct: not carried (history of the source year's reports) | delete: removed",
+}
+# Not tied to a year: kept by construction and deletion (unused companies / lookups are removed
+# by delete_year after its year's rows are gone).
+# pb1_comment: the PB-1 comments, one set for every year and company (Global Settings).
+GLOBAL_TABLES = frozenset({"company", "referent", "office", "app_user", "user_session", "pb1_comment"})
+
+
+def check_table_policies() -> None:
+    """Raises RuntimeError when a database table has no Migracija policy (see YEAR_TABLES)."""
+    from app.models import Base
+
+    tables = set(Base.metadata.tables)
+    missing = sorted(tables - set(YEAR_TABLES) - GLOBAL_TABLES)
+    stale = sorted((set(YEAR_TABLES) | GLOBAL_TABLES) - tables)
+    if missing or stale:
+        raise RuntimeError(
+            f"Migracija table policies out of date (app/migration.py YEAR_TABLES / GLOBAL_TABLES):"
+            f" no policy for {missing or '-'}; unknown {stale or '-'}"
+        )
 
 
 class MigrationError(ValueError):
@@ -68,6 +121,7 @@ class YearInfo(BaseModel):
     source: str  # workbook file name, or "<year> (iz <based_on_year>)"
     companies: int  # companies shown in the year's table
     pb1: str | None = None  # the year's PB-1 form: workbook file name, "<year> PB-1 (iz <year>)", or none
+    deletable: bool = False  # the latest year, constructed here: can be deleted (delete_year)
 
 
 class MigrationStatus(BaseModel):
@@ -86,6 +140,12 @@ class RegistryCompany(BaseModel):
     selected: bool  # in the given year (for the next year: proposed, i.e. in the source year)
 
 
+class DeleteResult(BaseModel):
+    year: int
+    companies: int  # company years removed (shown and hidden)
+    pb1_values: int  # PB-1 values removed (company values, template edits)
+
+
 class CompanySelection(BaseModel):
     company_ids: list[int]
 
@@ -96,11 +156,6 @@ class SelectionResult(BaseModel):
     added: int
     restored: int
     removed: int
-
-
-def _require_database() -> None:
-    if not database_enabled():
-        raise MigrationError(status.HTTP_409_CONFLICT, "Migracija needs the PostgreSQL database (DATABASE_URL)")
 
 
 def _gfi_sources(session: Session) -> list[SourceFile]:
@@ -114,41 +169,32 @@ def migration_status(session: Session) -> MigrationStatus:
             select(CompanyYear.year, func.count()).where(CompanyYear.active).group_by(CompanyYear.year)
         ).all()
     )
-    pb1_sources = {
-        s.year: s.file_name
-        for s in session.scalars(select(SourceFile).where(SourceFile.kind == "pb1", SourceFile.origin == "constructed"))
-    }
+    pb1_sources = {s.year: s.file_name for s in session.scalars(select(SourceFile).where(SourceFile.kind == "pb1"))}
     years = [
         YearInfo(
             year=s.year, origin=s.origin, based_on_year=s.based_on_year,
-            source=s.file_name, companies=counts.get(s.year, 0), pb1=_pb1_name(s.year, pb1_sources),
+            source=s.file_name, companies=counts.get(s.year, 0), pb1=pb1_sources.get(s.year),
+            deletable=i == 0 and s.origin == "constructed",
         )
-        for s in sources
+        for i, s in enumerate(sources)
     ]
     latest = sources[0].year if sources else None
     return MigrationStatus(years=years, next_year=latest + 1 if latest else None, source_year=latest)
 
 
-def _pb1_name(year: int, constructed: dict[int, str]) -> str | None:
-    if year in constructed:
-        return constructed[year]
-    path = find_pb1_workbook(get_data_dir(), year)
-    return path.name if path else None
-
-
 def ensure_pb1_form(session: Session, year: int, based_on_year: int, user: str) -> SourceFile | None:
     """The PB-1 form of a constructed year: the same three tabs as the form of the year it is
-    built from (every setting, formula and comment default with it), empty for every company.
-    Recorded as a constructed 'pb1' source_file; nothing is copied or written to a workbook.
+    built from (every setting and formula with it; the comments are global), empty for every company.
+    Recorded as a constructed 'pb1' source_file (database only; no file is read or written).
     None (with a warning) when the source year has no PB-1 form."""
     existing = session.scalar(select(SourceFile).where(SourceFile.kind == "pb1", SourceFile.year == year))
-    if existing is not None or find_pb1_workbook(get_data_dir(), year) is not None:
+    if existing is not None:
         return existing
-    template = pb1_template(based_on_year)
+    template = form_source(session, based_on_year)
     if template is None:
         logger.warning("No PB-1 form for %s: %s has none to build it from", year, based_on_year)
         return None
-    path, template_year = template
+    workbook = template[0].file_name
     pb1 = SourceFile(
         kind="pb1", year=year, origin="constructed", based_on_year=based_on_year,
         file_name=f"{year} PB-1 (iz {based_on_year})", sheet_name=PB1_TABS[0].sheet_prefix,
@@ -157,12 +203,11 @@ def ensure_pb1_form(session: Session, year: int, based_on_year: int, user: str) 
     session.add(pb1)
     session.flush()
     # As the form is in the app for the year it is built from: its form-level settings (shared
-    # template edits, default comments) are taken over; the source year's defaults are stored first.
-    comment_defaults(based_on_year, load_pb1_workbook(path), PB1_TABS[0].key, user)
-    edits, defaults = edits_store.copy_pb1_form_settings(based_on_year, path.name, year, path.name, user)
+    # template edits) are taken over; the comments are global (pb1_comment).
+    edits = copy_form_settings(session, based_on_year, year, user)
     logger.info(
-        "PB-1 form of %s constructed from %s (workbook %s, empty for every company; %d template edits, %d default comments taken over)",
-        year, based_on_year, path.name, edits, defaults,
+        "PB-1 form of %s constructed from %s (workbook %s, empty for every company; %d template edits taken over)",
+        year, based_on_year, workbook, edits,
     )
     return pb1
 
@@ -219,20 +264,47 @@ def registry(session: Session, year: int) -> list[RegistryCompany]:
     return sorted(out, key=lambda c: c.name.casefold())
 
 
+def _is_number(value: object) -> bool:
+    return isinstance(value, (int, float, Decimal)) and not isinstance(value, bool)
+
+
+def _copy_cell(target: SourceCellRow, source: SourceCellRow) -> None:
+    """The source cell exactly: value of the same kind, number format, formula flag."""
+    target.value_number, target.value_text, target.value_bool = source.value_number, source.value_text, source.value_bool
+    target.number_format, target.is_formula = source.number_format, source.is_formula
+
+
+def _cell_value(cell: SourceCellRow | None) -> object:
+    if cell is None:
+        return None
+    if cell.value_number is not None:
+        return cell.value_number
+    return cell.value_text if cell.value_text is not None else cell.value_bool
+
+
 def _copy_company(
     session: Session, source_file: SourceFile, columns: list[GfiColumn], template: CompanyYear,
-    template_formats: dict[str, str], row: int, now: datetime, user: str,
+    source_cells: dict[str, SourceCellRow], row: int, now: datetime, user: str,
 ) -> CompanyYear:
-    """A company's row in a constructed year: details carried over, status columns 0."""
+    """A company's row in a constructed year, built as a copy of its row in the source year so
+    that it behaves exactly the same (which cells are editable where, colors, alignment, "-"/0,
+    formats, formulas). Each snapshot cell is the source year's original cell; only the agreed
+    changes are applied:
+    - status columns (Preliminarni ... Predat) and the formula columns: 0 (status columns are
+      never empty; a non-number formula cell of the source stays as it is);
+    - company details (NAZIV, PIB, REFERENT, office): the current value (edits included); when
+      it equals the source's original, the original cell is copied as it is (same type, e.g. a
+      PIB stored as a number), otherwise the current value (a digits-only PIB that was a number
+      stays a number).
+    Columns without a mapped field are copied as they are."""
+    field_col = {c.field: c.col for c in columns if c.field}
+    statuses = {field: ZERO for field in NUMERIC_FIELDS}  # never empty
     company_year = CompanyYear(
         company_id=template.company_id, year=source_file.year, source_file_id=source_file.id, source_row=row,
         name=template.name, referent_id=template.referent_id, office_id=template.office_id,
-        kom=ZERO, preliminarni=ZERO, gfi_uradjen=ZERO, pb=ZERO, pb_predat=ZERO,
-        updated_at=now, updated_by=user, active=True,
+        updated_at=now, updated_by=user, active=True, **statuses,
     )
     session.add(company_year)
-    # The year's snapshot ("original" values): the carried-over details and the zeros, so the
-    # table marks later changes as edits, like for an imported year.
     details = {
         "name": template.name,
         "pib": template.company.pib,
@@ -240,40 +312,55 @@ def _copy_company(
         "office": template.office.name if template.office else None,
     }
     for column in columns:
-        cell = SourceCellRow(
-            source_file_id=source_file.id, row=row, col=column.col,
-            number_format=template_formats.get(column.col, "General"), is_formula=False,
-        )
+        source = source_cells.get(column.col)
+        cell = SourceCellRow(source_file_id=source_file.id, row=row, col=column.col, number_format="General", is_formula=False)
+        if source is not None:
+            _copy_cell(cell, source)
         if column.field in details:
-            cell.value_text = details[column.field]
+            current = details[column.field]
+            if text_of(current) != text_of(_from_db(_cell_value(source))):
+                cell.value_number = cell.value_text = cell.value_bool = None
+                if column.field == "pib" and source is not None and source.value_number is not None and current and current.isdigit():
+                    cell.value_number = Decimal(current)
+                else:
+                    cell.value_text = current
         elif column.field in NUMERIC_FIELDS:
-            cell.value_number = ZERO
+            cell.value_number, cell.value_text, cell.value_bool = ZERO, None, None
         elif column.field in FORMULA_FIELDS:
-            cell.value_number, cell.is_formula = ZERO, True
+            if source is not None and source.value_number is not None:
+                cell.value_number = ZERO
         session.add(cell)
     return company_year
 
 
-def _formats(session: Session, template: CompanyYear) -> dict[str, str]:
-    """Number formats of the template row in its year (column letter -> format)."""
-    return dict(
-        session.execute(
-            select(SourceCellRow.col, SourceCellRow.number_format).where(
+def _from_db(value: object) -> object:
+    """A snapshot value as the app compares it (Decimal -> int / float)."""
+    if isinstance(value, Decimal):
+        return int(value) if value == value.to_integral_value() else float(value)
+    return value
+
+
+def _source_cells(session: Session, template: CompanyYear) -> dict[str, SourceCellRow]:
+    """The template row's original cells in its year (column letter -> cell)."""
+    return {
+        cell.col: cell
+        for cell in session.scalars(
+            select(SourceCellRow).where(
                 SourceCellRow.source_file_id == template.source_file_id, SourceCellRow.row == template.source_row
             )
-        ).all()
-    )
+        )
+    }
 
 
 def construct_year(session: Session, year: int, company_ids: list[int], user: str) -> SelectionResult:
     """Builds `year` from the latest year with the selected companies (see the module doc)."""
     state = migration_status(session)
     if state.next_year is None:
-        raise MigrationError(status.HTTP_409_CONFLICT, "No year to build from: import a GFI workbook first")
+        raise MigrationError(status.HTTP_409_CONFLICT, "Nema godine iz koje bi se pravila nova: prvo treba uvesti GFI fajl.")
     if year != state.next_year:
-        raise MigrationError(status.HTTP_409_CONFLICT, f"Only the next year ({state.next_year}) can be constructed")
+        raise MigrationError(status.HTTP_409_CONFLICT, f"Može se napraviti samo sledeća godina ({state.next_year}).")
     if not company_ids:
-        raise MigrationError(status.HTTP_422_UNPROCESSABLE_CONTENT, "Select at least one company")
+        raise MigrationError(status.HTTP_422_UNPROCESSABLE_CONTENT, "Izaberite bar jednu firmu.")
     source = session.scalar(select(SourceFile).where(SourceFile.kind == "gfi", SourceFile.year == state.source_year))
     columns = list(session.scalars(
         select(GfiColumn).where(GfiColumn.source_file_id == source.id).order_by(GfiColumn.position)
@@ -281,7 +368,7 @@ def construct_year(session: Session, year: int, company_ids: list[int], user: st
     latest = _latest_company_years(session, year)
     unknown = sorted(set(company_ids) - set(latest))
     if unknown:
-        raise MigrationError(status.HTTP_422_UNPROCESSABLE_CONTENT, f"Unknown companies: {unknown[:10]}")
+        raise MigrationError(status.HTTP_422_UNPROCESSABLE_CONTENT, f"Nepoznate firme: {unknown[:10]}")
 
     now = datetime.now(timezone.utc)
     if session.get(ReportingYear, year) is None:
@@ -305,7 +392,7 @@ def construct_year(session: Session, year: int, company_ids: list[int], user: st
         if row in used_rows:  # a company from an older year whose row is taken
             row, next_row = next_row, next_row + 1
         used_rows.add(row)
-        _copy_company(session, target, columns, template, _formats(session, template), row, now, user)
+        _copy_company(session, target, columns, template, _source_cells(session, template), row, now, user)
     ensure_pb1_form(session, year, source.year, user)
     logger.info(
         "Year %s constructed from %s by '%s': %d companies (details carried over, statuses 0)",
@@ -319,19 +406,19 @@ def set_year_companies(session: Session, year: int, company_ids: list[int], user
     deselected one is hidden (its values are kept), a reselected one is shown again."""
     target = session.scalar(select(SourceFile).where(SourceFile.kind == "gfi", SourceFile.year == year))
     if target is None:
-        raise MigrationError(status.HTTP_404_NOT_FOUND, f"Year {year} doesn't exist")
+        raise MigrationError(status.HTTP_404_NOT_FOUND, f"Godina {year} ne postoji.")
     if target.origin != "constructed":
         raise MigrationError(
-            status.HTTP_409_CONFLICT, f"{year} comes from a workbook; only constructed years can be changed here"
+            status.HTTP_409_CONFLICT, f"Godina {year} je uvezena; ovde se menjaju samo napravljene godine."
         )
     wanted = set(company_ids)
     if not wanted:
-        raise MigrationError(status.HTTP_422_UNPROCESSABLE_CONTENT, "Select at least one company")
+        raise MigrationError(status.HTTP_422_UNPROCESSABLE_CONTENT, "Izaberite bar jednu firmu.")
     existing = {cy.company_id: cy for cy in session.scalars(select(CompanyYear).where(CompanyYear.year == year))}
     latest = _latest_company_years(session, year)
     unknown = sorted(wanted - set(latest) - set(existing))
     if unknown:
-        raise MigrationError(status.HTTP_422_UNPROCESSABLE_CONTENT, f"Unknown companies: {unknown[:10]}")
+        raise MigrationError(status.HTTP_422_UNPROCESSABLE_CONTENT, f"Nepoznate firme: {unknown[:10]}")
 
     now = datetime.now(timezone.utc)
     added = restored = removed = 0
@@ -355,7 +442,7 @@ def set_year_companies(session: Session, year: int, company_ids: list[int], user
             if row in used_rows:
                 row, next_row = next_row, next_row + 1
             used_rows.add(row)
-            _copy_company(session, target, columns, template, _formats(session, template), row, now, user)
+            _copy_company(session, target, columns, template, _source_cells(session, template), row, now, user)
             added += 1
     shown = len(wanted)
     logger.info(
@@ -365,9 +452,92 @@ def set_year_companies(session: Session, year: int, company_ids: list[int], user
     return SelectionResult(year=year, companies=shown, added=added, restored=restored, removed=removed)
 
 
+# Company details stored once per company (company table) and shared by all its years.
+SHARED_DETAILS = ("name", "pib")
+
+
+def _undo_shared_details(session: Session, year: int) -> int:
+    """Before a year is deleted: the shared company details (company.name, company.pib) its edits
+    changed get the value they would have without those edits: the last change made in another
+    year, or, without one, the value before the first change. Based on change_log (every edit is
+    logged), in time order. Returns the number of details restored."""
+    touched = session.execute(
+        select(CompanyYear.company_id, ChangeLog.field).distinct()
+        .join(ChangeLog, ChangeLog.company_year_id == CompanyYear.id)
+        .where(CompanyYear.year == year, ChangeLog.field.in_(SHARED_DETAILS))
+    ).all()
+    restored = 0
+    for company_id, field in touched:
+        history = session.execute(
+            select(ChangeLog.year, ChangeLog.old_text, ChangeLog.new_text)
+            .join(CompanyYear, ChangeLog.company_year_id == CompanyYear.id)
+            .where(CompanyYear.company_id == company_id, ChangeLog.field == field)
+            .order_by(ChangeLog.changed_at, ChangeLog.id)
+        ).all()
+        others = [h for h in history if h.year != year]
+        value = others[-1].new_text if others else history[0].old_text
+        company = session.get(Company, company_id)
+        if getattr(company, field) != value:
+            logger.info("Company %d %s restored to %r (its %s edits are deleted)", company_id, field, value, year)
+            setattr(company, field, value)
+            restored += 1
+    session.flush()
+    return restored
+
+
+def delete_year(session: Session, year: int, user: str) -> DeleteResult:
+    """Deletes the latest year, constructed here, completely: its companies' rows and values, its
+    PB-1 form with every value entered in it, its edit history (change_log) and the year itself.
+    Companies, referents and offices no other year uses are removed too (only ones the year itself
+    brought in: a constructed year reuses the companies of the year it was built from), and the
+    shared company details (name, PIB) its edits changed are restored (_undo_shared_details).
+    Nothing of the year is left and nothing of the other years changes."""
+    sources = _gfi_sources(session)
+    target = next((s for s in sources if s.year == year), None)
+    if target is None:
+        raise MigrationError(status.HTTP_404_NOT_FOUND, f"Godina {year} ne postoji.")
+    if target is not sources[0]:
+        raise MigrationError(status.HTTP_409_CONFLICT, f"Može se obrisati samo poslednja godina ({sources[0].year}).")
+    if target.origin != "constructed":
+        raise MigrationError(status.HTTP_409_CONFLICT, f"Godina {year} je uvezena; može se obrisati samo napravljena godina.")
+    built_from = session.scalar(select(func.count()).select_from(SourceFile).where(SourceFile.based_on_year == year, SourceFile.year != year))
+    if built_from:
+        raise MigrationError(status.HTTP_409_CONFLICT, f"Iz godine {year} je napravljena druga godina.")
+
+    company_years = select(CompanyYear.id).where(CompanyYear.year == year)
+    restored = _undo_shared_details(session, year)
+    companies = session.scalar(select(func.count()).select_from(CompanyYear).where(CompanyYear.year == year))
+    pb1_values = 0
+    pb1_values += session.execute(delete(Pb1CompanyEdit).where(Pb1CompanyEdit.company_year_id.in_(company_years))).rowcount
+    session.execute(delete(Pb1ReportState).where(Pb1ReportState.company_year_id.in_(company_years)))
+    session.execute(delete(Pb1ReportEvent).where(Pb1ReportEvent.company_year_id.in_(company_years)))
+    pb1_values += session.execute(delete(Pb1TemplateEdit).where(Pb1TemplateEdit.year == year)).rowcount
+    session.execute(delete(Pb1Link).where(Pb1Link.year == year))
+    history = session.execute(delete(ChangeLog).where(
+        (ChangeLog.year == year) | ChangeLog.company_year_id.in_(company_years)
+    )).rowcount
+    # The year's sources; cascades to gfi_column, source_cell, company_year, import_issue (and a
+    # PB-1 snapshot).
+    session.execute(delete(SourceFile).where(SourceFile.year == year))
+    session.execute(delete(ReportingYear).where(ReportingYear.year == year))
+    session.flush()
+    used_companies = select(CompanyYear.company_id)
+    removed_companies = session.execute(delete(Company).where(Company.id.not_in(used_companies))).rowcount
+    removed_lookups = session.execute(delete(Referent).where(Referent.id.not_in(
+        select(CompanyYear.referent_id).where(CompanyYear.referent_id.is_not(None))
+    ))).rowcount + session.execute(delete(Office).where(Office.id.not_in(
+        select(CompanyYear.office_id).where(CompanyYear.office_id.is_not(None))
+    ))).rowcount
+    logger.warning(
+        "Year %s deleted by '%s': %d company years, %d PB-1 values, %d history rows; %d shared company details restored;"
+        " %d companies and %d referents/offices no longer used removed",
+        year, user, companies, pb1_values, history, restored, removed_companies, removed_lookups,
+    )
+    return DeleteResult(year=year, companies=companies, pb1_values=pb1_values)
+
+
 def _run(work):
     try:
-        _require_database()
         with session_scope() as session:
             return work(session)
     except MigrationError as exc:
@@ -395,3 +565,9 @@ def post_construct_year(year: int, selection: CompanySelection, username: str = 
 @router.put("/years/{year}/companies")
 def put_year_companies(year: int, selection: CompanySelection, username: str = Depends(require_user)) -> SelectionResult:
     return _run(lambda session: set_year_companies(session, year, selection.company_ids, username))
+
+
+@router.delete("/years/{year}")
+def delete_constructed_year(year: int, username: str = Depends(require_user)) -> DeleteResult:
+    """Deletes the latest year if it was constructed here (see delete_year)."""
+    return _run(lambda session: delete_year(session, year, username))

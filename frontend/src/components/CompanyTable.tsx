@@ -1,4 +1,4 @@
-import { memo, useMemo, useState, type KeyboardEvent } from "react";
+import { memo, useEffect, useMemo, useRef, useState, type KeyboardEvent } from "react";
 import { Link } from "react-router";
 import { Button } from "@/components/ui/button";
 import { Skeleton } from "@/components/ui/skeleton";
@@ -17,7 +17,8 @@ import {
   type CompanyRow,
   type CompanyTableData,
 } from "@/hooks/use-company-table";
-import { formatNumber, parseNumberInput, toEditText } from "@/lib/excel-format";
+import { formatNumber, toEditText } from "@/lib/excel-format";
+import { matches, searchText } from "@/lib/search";
 import { cn } from "@/lib/utils";
 
 /**
@@ -25,8 +26,8 @@ import { cn } from "@/lib/utils";
  * - "home": the compact Home table. Hidden columns, PIB below the name, empty numbers shown
  *   as 0, empty referent cells as "-". Company details are read-only. An "Actions" column
  *   opens the three tabs of the company's PB-1 form.
- * - "registry": the Company Registry, for editing. Columns # … "PB-1,PB-2 za rad", fitted to
- *   the screen; nothing is truncated (rows grow instead). Empty cells show 0 (from kom on)
+ * - "registry": Edit Company Data, for editing. Columns # … "PB-1, PB-2 Predat" (no formula columns), fitted to
+ *   the screen; nothing is truncated (rows grow instead). Empty cells show 0 (from Preliminarni on)
  *   or "-" (company details) and can be filled in. Company details (NAZIV, PIB, REFERENT,
  *   office) are editable as text.
  *   Home's "Naziv (PIB)" column shows two of these values together: NAZIV, and the PIB
@@ -41,18 +42,21 @@ const RIGHT_ANCHORED_COLUMNS = 3;
 const NAME_HEADER = "NAZIV";
 const NAME_DISPLAY_HEADER = "Naziv (PIB)";
 const PIB_HEADER = "PIB";
-const KOM_HEADER = "KOM";
-// Home: these columns are hidden; their data, edits and the API are unchanged.
-const HIDDEN_HEADERS = new Set([KOM_HEADER, PIB_HEADER]);
-// Home: only real PIBs (9 digits) are shown below the name.
-const PIB_PATTERN = /^\d{9}$/;
+// Home: the PIB column is hidden (shown below the name); its data, edits and the API are unchanged.
+// ("kom" is not a column any more: kom = 1 for every company, set by the server.)
+const HIDDEN_HEADERS = new Set([PIB_HEADER]);
+// Home: a PIB (9 digits) or JMBG (13) is shown below the name; an empty one as "-".
+const PIB_PATTERN = /^(\d{9}|\d{13})$/;
 
 // Home: from this column to the last one, the columns are numeric and empty cells are shown as 0.
 const FIRST_NUMERIC_HEADER = "PRELIMINARNI";
-// Registry: numeric columns start at "kom".
-const REGISTRY_FIRST_NUMERIC_HEADER = KOM_HEADER;
+// Edit Company Data: numeric columns start at "Preliminarni", as on Home.
+const REGISTRY_FIRST_NUMERIC_HEADER = FIRST_NUMERIC_HEADER;
 // Home: the unnamed column right after this one (column N) is hidden.
 const LAST_SHOWN_HEADER = "PB-1,PB-2 ZA RAD";
+// Edit Company Data (variant "registry"): the formula columns are not shown; nothing is entered
+// in them (user's rule). Home shows them, shaded.
+const FORMULA_HEADERS = new Set(["GFI ZA RAD", LAST_SHOWN_HEADER]);
 // Home: REFERENT and the unnamed column right after it (office): empty cells are shown as "-".
 const REFERENT_HEADER = "REFERENT";
 const EMPTY_TEXT_PLACEHOLDER = "-";
@@ -68,7 +72,7 @@ const PB1_ACTIONS = [
   {
     path: "/uporedo",
     label: "Uporedo",
-    title: "PB-1 · Uporedo (current and previous year)",
+    title: "PB-1 · Uporedo (tekuća i prethodna godina)",
     className: "border-chart-2/40 bg-chart-2/10 text-chart-2 hover:bg-chart-2/20 hover:text-chart-2",
   },
   {
@@ -104,14 +108,43 @@ function Pb1Actions({ year, row }: { year: number; row: number }) {
 // Vertical column border; an inset shadow, so it stays visible on sticky cells.
 const COLUMN_BORDER = "not-last:shadow-[inset_-1px_0_var(--border)]";
 
-// Validation of company details (the backend checks the same).
-type TextRule = "name" | "pib" | undefined;
-const PIB_INPUT = /^\d+$/;
-const TEXT_RULE_MESSAGES: Record<"number" | "name" | "pib", string> = {
-  number: "Enter a number, e.g. 1234,56",
-  name: "Company name can't be empty",
-  pib: "PIB may contain digits only",
+// Input rules (user's decisions, 2026-11-14; the backend enforces the same, see app/gfi_store.py):
+// - NAZIV, REFERENT, office: upper case while typing (as with caps lock on); NAZIV can't be empty;
+// - PIB: digits only (other characters are not accepted), 9 digits (PIB) or 13 (JMBG); empty allowed;
+// - status columns (the numeric cells that can be edited): only 0 or 1, never empty: an empty
+//   editor saves 0;
+// - an empty detail (PIB, REFERENT, office) is shown as "-"; "-" entered means empty.
+// Invalid input is not accepted (user's rule): a character that isn't allowed is not typed in
+// (short red flash), and a value that isn't valid on Enter / leaving the field turns the border
+// red and the field goes back to its old value.
+type TextRule = "name" | "pib" | "upper" | undefined;
+const PIB_INPUT = /^(\d{9}|\d{13})$/;
+const PIB_MAX_LENGTH = 13;
+const TEXT_RULE_MESSAGES: Record<"number" | "name" | "pib" | "upper", string> = {
+  number: "Dozvoljene su samo vrednosti 0 i 1.",
+  name: "Naziv firme ne može biti prazan.",
+  pib: "PIB mora imati 9 cifara, ili 13 cifara za JMBG fizičkog lica.",
+  upper: "Neispravan unos.",
 };
+// How long the red border shows before the field goes back to its old value (ms).
+const INVALID_REVERT_MS = 900;
+// A character that isn't allowed: how long the red border flashes (ms).
+const INVALID_FLASH_MS = 600;
+
+/** The typed text as the field accepts it, or undefined when it can't be accepted at all. */
+function acceptInput(text: string, kind: "number" | "text", rule: TextRule): string | undefined {
+  if (kind === "number") return /^[01]?$/.test(text.trim()) ? text.trim() : undefined;
+  if (rule === "pib") return /^\d*$/.test(text) && text.length <= PIB_MAX_LENGTH ? text : undefined;
+  if (rule === "name" || rule === "upper") return text.toUpperCase();
+  return text;
+}
+
+/** A status value: 0 or 1 (an empty editor means 0), or undefined when not valid. */
+function parseStatus(text: string): number | undefined {
+  const value = text.trim();
+  if (value === "") return 0;
+  return value === "0" || value === "1" ? Number(value) : undefined;
+}
 
 const normalizeHeader = (header: string | null) => header?.trim().toUpperCase() ?? "";
 
@@ -124,10 +157,10 @@ const isBlank = (value: CellValue) => value === null || (typeof value === "strin
 export const textOf = (value: CellValue | undefined) =>
   value === null || value === undefined || typeof value === "boolean" ? null : String(value).trim() || null;
 
-function pibText(cell: CompanyCell | undefined): string | undefined {
+function pibText(cell: CompanyCell | undefined): string {
   const value = cell?.value;
   const text = typeof value === "number" || typeof value === "string" ? String(value).trim() : "";
-  return PIB_PATTERN.test(text) ? text : undefined;
+  return PIB_PATTERN.test(text) ? text : EMPTY_TEXT_PLACEHOLDER;
 }
 
 export type CommitCell = (row: number, column: string, value: number | string | null) => void;
@@ -140,20 +173,21 @@ function formatValue(value: CellValue, format: string | undefined): { text: stri
 }
 
 function cellTitle(cell: CompanyCell, canEdit: boolean): string | undefined {
-  if (cell.formula) return "Formula (read-only)";
+  if (cell.formula) return "Formula (samo za čitanje)";
   if (cell.edited) {
     const original = cell.text
-      ? textOf(originalValue(cell)) || "empty"
-      : formatValue(originalValue(cell), cell.format).text || "empty";
-    return `Changed. Excel value: ${original}`;
+      ? textOf(originalValue(cell)) || "prazno"
+      : formatValue(originalValue(cell), cell.format).text || "prazno";
+    return `Izmenjeno. Prvobitna vrednost: ${original}`;
   }
-  if (canEdit) return "Click to edit";
+  if (canEdit) return "Kliknite za izmenu";
   return undefined;
 }
 
 function parseText(text: string, rule: TextRule): string | null | undefined {
   const value = text.trim();
-  if (value === "") return rule === "name" ? undefined : null;
+  // "-" is how an empty detail is shown; entered, it means empty (NAZIV can't be empty).
+  if (value === "" || value === EMPTY_TEXT_PLACEHOLDER) return rule === "name" ? undefined : null;
   if (rule === "pib" && !PIB_INPUT.test(value)) return undefined;
   return value;
 }
@@ -177,16 +211,25 @@ function CellEditor({
     kind === "number" ? toEditText(typeof cell.value === "number" ? cell.value : null) : (textOf(cell.value) ?? ""),
   );
   const [invalid, setInvalid] = useState(false);
-  const parse = (input: string) => (kind === "number" ? parseNumberInput(input) : parseText(input, rule));
+  const [reverting, setReverting] = useState(false);
+  const flashTimer = useRef<number | undefined>(undefined);
+  useEffect(() => () => window.clearTimeout(flashTimer.current), []);
+  const parse = (input: string) => (kind === "number" ? parseStatus(input) : parseText(input, rule));
+
+  // A value that isn't valid: red border, then back to the old value (the edit is cancelled).
+  const rejectAndRevert = () => {
+    setReverting(true);
+    setInvalid(true);
+    window.clearTimeout(flashTimer.current);
+    flashTimer.current = window.setTimeout(() => onDone(undefined), INVALID_REVERT_MS);
+  };
 
   // undefined = cancel (keep the current value)
   const finish = (commit: boolean) => {
+    if (reverting) return;
     if (!commit) return onDone(undefined);
     const parsed = parse(text);
-    if (parsed === undefined) {
-      setInvalid(true);
-      return;
-    }
+    if (parsed === undefined) return rejectAndRevert();
     onDone(parsed);
   };
 
@@ -198,20 +241,31 @@ function CellEditor({
   return (
     <input
       autoFocus
-      inputMode={kind === "number" || rule === "pib" ? "decimal" : "text"}
+      inputMode={kind === "number" || rule === "pib" ? "numeric" : "text"}
+      maxLength={kind === "number" ? 1 : rule === "pib" ? PIB_MAX_LENGTH : undefined}
       aria-label="Cell value"
       aria-invalid={invalid || undefined}
-      title={invalid ? TEXT_RULE_MESSAGES[kind === "number" ? "number" : (rule ?? "name")] : undefined}
+      title={invalid ? TEXT_RULE_MESSAGES[kind === "number" ? "number" : (rule ?? "upper")] : undefined}
       value={text}
       placeholder={hint}
       onFocus={(e) => e.currentTarget.select()}
+      readOnly={reverting}
       onChange={(e) => {
-        setText(e.target.value);
+        if (reverting) return;
+        const accepted = acceptInput(e.target.value, kind, rule);
+        window.clearTimeout(flashTimer.current);
+        if (accepted === undefined) {
+          // Not accepted (e.g. a letter in PIB, 2 in a status column): the text stays, a short red flash.
+          setInvalid(true);
+          flashTimer.current = window.setTimeout(() => setInvalid(false), INVALID_FLASH_MS);
+          return;
+        }
+        setText(accepted);
         setInvalid(false);
       }}
       onKeyDown={onKeyDown}
-      // Leaving the field saves a valid value and discards invalid input.
-      onBlur={() => (parse(text) === undefined ? finish(false) : finish(true))}
+      // Leaving the field saves a valid value; an invalid one turns red and goes back.
+      onBlur={() => finish(true)}
       className={cn(
         "border-ring ring-ring/50 bg-background aria-invalid:border-destructive aria-invalid:ring-destructive/20 -my-1 h-7 w-full rounded-sm border px-1.5 ring-[3px] outline-none",
         kind === "number" ? "text-end tabular-nums" : "text-start",
@@ -230,6 +284,9 @@ function DataCell({
   numeric = false,
   zeroFill = false,
   statusColors = false,
+  shadeFormula = false,
+  shadeAll = false,
+  viewOnly = false,
   emptyPlaceholder,
   allowText = false,
   textRule,
@@ -245,8 +302,17 @@ function DataCell({
   zeroFill?: boolean; // empty cells are displayed as 0 (display only)
   // Home status columns (Preliminarni … PB-1,PB-2 za rad, values 0 / 1): 1 green, 0 red.
   statusColors?: boolean;
+  // Home: the formula columns (GFI ZA RAD, PB-1,PB-2 za rad) are shaded, so they read as
+  // computed from the other columns, not filled in (user's rule).
+  shadeFormula?: boolean;
+  // Shaded because nothing can be entered here (user, 2026-11-17): every Home cell (Home is view
+  // only), and the status columns on Edit Company Data (set only by the PB-1 report steps).
+  shadeAll?: boolean;
+  // Home is view only (user, 2026-11-17): its cells don't react to the mouse at all (no
+  // highlight, no enlarged preview box, no tooltip).
+  viewOnly?: boolean;
   emptyPlaceholder?: string; // shown (muted) instead of an empty read-only cell (display only)
-  allowText?: boolean; // company details can be edited (Company Registry)
+  allowText?: boolean; // company details can be edited (Edit Company Data)
   textRule?: TextRule;
   // Registry: read-only cells don't react to the mouse (no highlight, preview or tooltip),
   // and editors fit the fixed-width cell.
@@ -272,11 +338,11 @@ function DataCell({
   const isNumber = !cell.text && (numeric || typeof value === "number" || (kind === "number" && value === null));
   // No reaction to the mouse (highlight, preview, tooltip): read-only cells in the Registry,
   // and the formula columns (GFI ZA RAD, PB-1,PB-2 za rad) on every page.
-  const still = (quiet && !canEdit) || Boolean(cell.formula);
+  const still = viewOnly || (quiet && !canEdit) || Boolean(cell.formula);
   const title = still
     ? undefined
     : (zeroFilled || placeholder) && !canEdit && !cell.edited && !cell.formula
-      ? "Empty in Excel (read-only)"
+      ? "Prazno (samo za čitanje)"
       : cellTitle(cell, canEdit);
 
   const startEditing = () => {
@@ -300,10 +366,13 @@ function DataCell({
         quiet && "whitespace-normal",
         !still && "hover:bg-accent hover:text-accent-foreground",
         COLUMN_BORDER,
+        (shadeAll || (shadeFormula && cell.formula)) && "bg-muted/60",
         isNumber && "text-end tabular-nums",
         red && "text-destructive hover:text-destructive",
         green && "text-success hover:text-success",
-        canEdit && "focus-visible:ring-ring/50 cursor-text outline-none focus-visible:ring-[3px] focus-visible:ring-inset",
+        // Clickable (opens the editor): pointing hand, as everything clickable in the app.
+        canEdit && "focus-visible:ring-ring/50 outline-none focus-visible:ring-[3px] focus-visible:ring-inset",
+        canEdit && !editing && "cursor-pointer",
         // Edited cells: small corner marker, like Excel's comment indicator.
         cell.edited &&
           "after:border-t-primary after:border-r-primary after:absolute after:top-0 after:right-0 after:border-4 after:border-b-transparent after:border-l-transparent",
@@ -333,7 +402,14 @@ function DataCell({
               {text}
             </Link>
           ) : (
-            <span className={cn("block", quiet ? "break-words" : "truncate", placeholder && "text-muted-foreground")}>
+            <span
+              className={cn(
+                "block",
+                // Without a preview (Registry, view-only Home) a long value wraps instead of being cut.
+                quiet || viewOnly ? "break-words whitespace-normal" : "truncate",
+                placeholder && "text-muted-foreground",
+              )}
+            >
               {placeholder ?? text}
             </span>
           )}
@@ -393,8 +469,9 @@ function planColumns(columns: CompanyColumn[], variant: TableVariant): ColumnPla
   };
 
   if (variant === "registry") {
-    // The workbook columns (NAZIV and PIB separate), ending with "PB-1,PB-2 za rad".
-    const visible = withoutColumnAfterLast(columns);
+    // The workbook columns (NAZIV and PIB separate), ending with "PB-1, PB-2 Predat": without the
+    // formula columns (GFI ZA RAD, PB-1,PB-2 za rad) and the unnamed column N.
+    const visible = withoutColumnAfterLast(columns).filter((c) => !FORMULA_HEADERS.has(normalizeHeader(c.header)));
     const referent = visible.findIndex((c) => normalizeHeader(c.header) === REFERENT_HEADER);
     const numeric = keysFrom(visible, REGISTRY_FIRST_NUMERIC_HEADER);
     const fixed: Record<string, number> = {};
@@ -411,7 +488,7 @@ function planColumns(columns: CompanyColumn[], variant: TableVariant): ColumnPla
       pibColumn: pib,
       visibleColumns: visible,
       numericColumns: numeric,
-      // Empty cells: 0 from "kom" on, "-" in the columns left of it (display only).
+      // Empty cells: 0 from "Preliminarni" on, "-" in the columns left of it (display only).
       zeroFillColumns: numeric,
       placeholderColumns: new Set(visible.filter((c) => !numeric.has(c.key)).map((c) => c.key)),
       widths: Object.fromEntries(visible.map((c) => [c.key, `${(fixed[c.key] ?? share).toFixed(2)}%`])),
@@ -454,7 +531,6 @@ const DataRow = memo(function DataRow({
     <TableRow>
       {/* "#": position in the company list. Edits and links use the Excel row number (row.row). */}
       <TableCell
-        title={home ? `Excel row ${row.row}` : undefined}
         className="bg-background text-muted-foreground sticky left-0 z-10 w-10 px-1.5 py-1 text-end text-xs tabular-nums shadow-[inset_-1px_0_var(--border)]"
       >
         {number}
@@ -472,9 +548,12 @@ const DataRow = memo(function DataRow({
             numeric={plan.numericColumns.has(column.key)}
             zeroFill={plan.zeroFillColumns.has(column.key)}
             statusColors={home && plan.numericColumns.has(column.key)}
+            shadeFormula={home}
+            shadeAll={home || plan.numericColumns.has(column.key)}
+            viewOnly={home}
             emptyPlaceholder={plan.placeholderColumns.has(column.key) ? EMPTY_TEXT_PLACEHOLDER : undefined}
             allowText={!home}
-            textRule={isNameColumn ? "name" : column.key === pibColumn ? "pib" : undefined}
+            textRule={isNameColumn ? "name" : column.key === pibColumn ? "pib" : "upper"}
             quiet={!home}
             fillEmpty={!home}
           />
@@ -496,23 +575,41 @@ export function CompanyTable({
   onCommit,
   year,
   variant = "home",
+  query = "",
+  onShown,
 }: {
   data: CompanyTableData;
   onCommit: CommitCell;
   year: number;
   variant?: TableVariant;
+  // Search (header field): only the companies whose name, PIB, referent or office contain it.
+  query?: string;
+  onShown?: (count: number) => void; // how many companies the search shows
 }) {
   // The API returns only the company list (165 rows for 2025), in order.
   const { columns, rows } = data;
   const plan = useMemo(() => planColumns(columns, variant), [columns, variant]);
   const registry = variant === "registry";
+  // Each company keeps its position in the list (#) while the search hides others.
+  const wanted = searchText(query);
+  const listed = useMemo(
+    () =>
+      rows
+        .map((row, index) => ({ row, number: index + 1 }))
+        .filter(({ row }) => !wanted || matches(wanted, Object.values(row.cells).filter((c) => c.text).map((c) => c.value))),
+    [rows, wanted],
+  );
+  useEffect(() => onShown?.(listed.length), [listed.length, onShown]);
 
   return (
     // Registry: fixed column widths, so the table always fits the screen (no horizontal scroll).
     <div
       className={cn(
-        "max-h-[calc(100svh-12rem)] rounded-md border",
-        registry ? "overflow-x-hidden overflow-y-auto" : "overflow-auto",
+        "rounded-md border",
+        // Home: the statistics cards float at the top (sticky, about 8rem, under the 4rem page
+        // header). Scrolling the page moves the title away and the table fills the screen below
+        // the cards (4rem header + 8rem cards + bottom padding).
+        registry ? "max-h-[calc(100svh-12rem)] overflow-x-hidden overflow-y-auto" : "max-h-[calc(100svh-14rem)] overflow-auto",
       )}
     >
       <table className={cn("w-full caption-bottom text-sm", registry && "table-fixed")}>
@@ -525,9 +622,9 @@ export function CompanyTable({
           </colgroup>
         )}
         <TableHeader className="bg-muted sticky top-0 z-20 [&_tr]:border-b-0 shadow-[inset_0_-1px_0_var(--border)]">
+          {/* No tooltips on the headers (user's rule, Home and Edit Company Data). */}
           <TableRow className="hover:bg-transparent">
             <TableHead
-              title={registry ? undefined : "Number in the company list"}
               className="bg-muted text-muted-foreground sticky left-0 z-10 h-auto w-10 px-1.5 py-1.5 text-end align-bottom shadow-[inset_-1px_0_var(--border)]"
             >
               #
@@ -543,7 +640,6 @@ export function CompanyTable({
                   plan.numericColumns.has(column.key) && "text-end",
                   COLUMN_BORDER,
                 )}
-                title={registry ? undefined : `Column ${column.key}`}
               >
                 {variant === "home" && column.key === plan.nameColumn
                   ? NAME_DISPLAY_HEADER
@@ -556,9 +652,16 @@ export function CompanyTable({
           </TableRow>
         </TableHeader>
         <TableBody>
-          {rows.map((row, index) => (
-            <DataRow key={row.row} row={row} number={index + 1} plan={plan} onCommit={onCommit} year={year} />
+          {listed.map(({ row, number }) => (
+            <DataRow key={row.row} row={row} number={number} plan={plan} onCommit={onCommit} year={year} />
           ))}
+          {wanted && listed.length === 0 && (
+            <TableRow className="hover:bg-transparent">
+              <TableCell colSpan={plan.visibleColumns.length + 2} className="text-muted-foreground py-6 text-center">
+                Nijedna firma ne odgovara pretrazi.
+              </TableCell>
+            </TableRow>
+          )}
         </TableBody>
       </table>
     </div>

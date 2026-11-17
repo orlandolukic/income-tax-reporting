@@ -26,6 +26,10 @@
   --accent-foreground: oklch(0.205 0 0);
   --destructive: oklch(0.577 0.245 27.325);
   --success: oklch(0.527 0.154 150.069);
+  /* The app's mark (AppLogo, favicon.svg): blue tile, white columns, golden roof. */
+  --brand: oklch(0.546 0.215 262.9);
+  --brand-foreground: oklch(0.985 0 0);
+  --brand-accent: oklch(0.828 0.189 84.429);
   --border: oklch(0.922 0 0);
   --input: oklch(0.922 0 0);
   --ring: oklch(0.708 0 0);
@@ -62,6 +66,9 @@
   --accent-foreground: oklch(0.985 0 0);
   --destructive: oklch(0.704 0.191 22.216);
   --success: oklch(0.723 0.192 149.579);
+  --brand: oklch(0.585 0.2 262.9);
+  --brand-foreground: oklch(0.985 0 0);
+  --brand-accent: oklch(0.828 0.189 84.429);
   --border: oklch(1 0 0 / 10%);
   --input: oklch(1 0 0 / 15%);
   --ring: oklch(0.556 0 0);
@@ -100,6 +107,9 @@
   --color-accent-foreground: var(--accent-foreground);
   --color-destructive: var(--destructive);
   --color-success: var(--success);
+  --color-brand: var(--brand);
+  --color-brand-foreground: var(--brand-foreground);
+  --color-brand-accent: var(--brand-accent);
   --color-border: var(--border);
   --color-input: var(--input);
   --color-ring: var(--ring);
@@ -120,7 +130,32 @@
   * {
     @apply border-border outline-ring/50;
   }
+  /* Everything clickable shows the pointing hand (Tailwind v4 gives buttons the default arrow).
+     In the base layer, so a component's own cursor class still wins (e.g. the sidebar rail's
+     resize cursor, cursor-not-allowed on disabled fields). */
+  button:not(:disabled),
+  [role="button"]:not([aria-disabled="true"]),
+  [role="tab"]:not([aria-disabled="true"]),
+  [role="checkbox"]:not([aria-disabled="true"]),
+  [role="switch"]:not([aria-disabled="true"]),
+  [role="combobox"]:not([aria-disabled="true"]),
+  summary,
+  label[for],
+  select:not(:disabled),
+  a[href] {
+    cursor: pointer;
+  }
   body {
     @apply bg-background text-foreground font-sans antialiased;
   }
+}
+
+/* Menu and list items: shadcn gives them cursor-default (a utility class, which beats the base
+   layer), so they get the pointing hand here, outside the layers. Disabled items keep theirs. */
+[data-slot="dropdown-menu-item"]:not([data-disabled]),
+[data-slot="dropdown-menu-checkbox-item"]:not([data-disabled]),
+[data-slot="dropdown-menu-radio-item"]:not([data-disabled]),
+[data-slot="dropdown-menu-sub-trigger"]:not([data-disabled]),
+[data-slot="select-item"]:not([data-disabled]) {
+  cursor: pointer;
 }

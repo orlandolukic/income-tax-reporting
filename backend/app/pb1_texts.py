@@ -14,7 +14,7 @@ CORRECTIONS: dict[str, str] = {
     # Headers and section headings
     "Komentar stopa konto": "Komentar, stopa, konto",
     "A Poslovna dobit i gubitak": "A. Poslovna dobit i gubitak",
-    "B Poreska osnovica": "V. Poreska osnovica",  # A., B., V. (after "B. Kapitalni dobici i gubici")
+    "B Poreska osnovica": "Poreska osnovica",  # heading of the closing rows; no "V." (it doesn't fit the numbering, user 2026-11-17)
     "V Rashodi i prihodi po osnovu transfernih cena (osim kamata na zajmove odnosnoi kredite)":
         "V Rashodi i prihodi po osnovu transfernih cena (osim kamata na zajmove odnosno kredite)",
     "VI Rashodi i prihodi po osnovu kamata na zajmoe odnosno kredite izmedju povezanih lica":

@@ -1,6 +1,8 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { useAutosave } from "@/context/CellAutosaveProvider";
-import type { PendingEdit } from "@/hooks/use-cell-autosave";
+import type { Pb1Report, PendingEdit } from "@/hooks/use-cell-autosave";
+
+export type { Pb1Report };
 import { getLogger } from "@/logger";
 
 const logger = getLogger("pb1");
@@ -24,6 +26,8 @@ export type Pb1Column = {
   wrap?: boolean;
   amount?: boolean; // amount column (right-aligned)
   narrow?: boolean; // line-number column ("#"); longer text overflows into empty cells to the right
+  dash_empty?: boolean; // an empty field is shown as "-" and "-" entered means empty (Konto)
+  overrun?: boolean; // a positive value is an overrun, shown red (Prekoracenje)
 };
 export type Pb1Tab = { key: string; title: string };
 export type Pb1Row = {
@@ -45,10 +49,24 @@ export type Pb1Data = {
   head?: Pb1Row[]; // the sheet's first rows (Poreski bilans), shown as a separate table above the form
   head_columns?: Pb1Column[]; // the head table's columns, one to one with `columns`
   // Column of the comments (in the rows' cells, not in `columns`): shown beside the table as
-  // description-comment pairs, one per row; each company has its own.
+  // description-comment pairs; global (the same for every year and company), shown only on Global Settings.
   comment_column?: string;
   loss?: { base: number }; // tax loss: the Poreski bilans tax base is negative ("Gubitak!")
+  results?: Pb1Results; // accounting and tax result, shown beside the closing rows of Poreski bilans
+  // The company's two reports (user, 2026-11-17): which one this is and where they stand.
+  // Omitted by the API when false / "preliminary".
+  report?: Pb1Report;
+  preliminary_done?: boolean; // the preliminary report is done: locked, still viewable
+  gfi_done?: boolean; // GFI is done: the final report can be created
+  final_created?: boolean; // the final report has been created from the preliminary one
+  final_done?: boolean; // the final report is done: locked until unlocked
+  submitted_at?: string; // the report is submitted (ISO date and time)
+  locked?: boolean; // nothing can be changed in this report
 };
+
+/** A result of the form: its amount and whether it is a profit, a loss or zero. */
+export type Pb1Result = { value: number; status: "profit" | "loss" | "zero" };
+export type Pb1Results = { accounting: Pb1Result; tax: Pb1Result };
 
 /** Saves one field: Excel row and column of the form, the new value (null clears it). */
 export type Pb1Commit = (row: number, column: string, value: number | string | null) => void;
@@ -85,7 +103,14 @@ function applyPending(data: Pb1Data, pending: PendingEdit[]): Pb1Data {
  * edits its fields through the app-wide autosave queue (amounts for this company, template
  * fields for every company).
  */
-export function usePb1(year: number, row: number, tab: string, onUnauthorized: () => void) {
+export function usePb1(
+  year: number,
+  row: number,
+  tab: string,
+  // undefined: the server's choice (final once the preliminary report is done)
+  report: Pb1Report | undefined,
+  onUnauthorized: () => void,
+) {
   const autosave = useAutosave();
   const [data, setData] = useState<Pb1Data | null>(null);
   const [loading, setLoading] = useState(true);
@@ -98,7 +123,8 @@ export function usePb1(year: number, row: number, tab: string, onUnauthorized: (
     const controller = new AbortController();
     setLoading(true);
     setError(null);
-    fetch(`/api/reporting-years/${year}/companies/${row}/pb1/${tab}`, { signal: controller.signal })
+    const query = report ? `?report=${report}` : "";
+    fetch(`/api/reporting-years/${year}/companies/${row}/pb1/${tab}${query}`, { signal: controller.signal })
       .then(async (res) => {
         if (res.status === 401) {
           onUnauthorized();
@@ -106,26 +132,26 @@ export function usePb1(year: number, row: number, tab: string, onUnauthorized: (
         }
         if (res.status === 404) {
           const body = await res.json().catch(() => null);
-          throw new Error(body?.detail ?? "Not found");
+          throw new Error(body?.detail ?? "Nije pronađeno.");
         }
         if (!res.ok) throw new Error(`HTTP ${res.status}`);
         return res.json();
       })
       .then((pb1: Pb1Data) => {
-        setData(applyPending(pb1, pendingRef.current(year, row, tab)));
+        setData(applyPending(pb1, pendingRef.current(year, row, tab, pb1.report ?? "preliminary")));
         logger.debug(`PB-1 ${tab} loaded for row ${row} (${year}), values: ${Boolean(pb1.has_values)}`);
       })
       .catch((err: Error) => {
         if (controller.signal.aborted) return;
         logger.error(`Failed to load PB-1 for row ${row} (${year})`, err);
-        setError(err.message.startsWith("HTTP") ? "Unable to load the PB-1 table." : err.message);
+        setError(err.message.startsWith("HTTP") ? "PB-1 tabela nije mogla da se učita." : err.message);
       })
       .finally(() => {
         if (!controller.signal.aborted) setLoading(false);
       });
     return () => controller.abort();
     // onUnauthorized is intentionally not a dependency: it must not trigger a reload.
-  }, [year, row, tab, reloadKey]);
+  }, [year, row, tab, report, reloadKey]);
 
   // Save results for this form: mark the field as edited or not (the server decides), and show
   // the tab's recomputed formula cells.
@@ -134,7 +160,8 @@ export function usePb1(year: number, row: number, tab: string, onUnauthorized: (
       edit.pb1 !== undefined &&
       edit.year === year &&
       edit.pb1.tab === tab &&
-      (edit.pb1.shared || edit.pb1.company === row);
+      (edit.pb1.shared ||
+        (edit.pb1.company === row && (edit.pb1.report ?? "preliminary") === (dataRef.current?.report ?? "preliminary")));
     return autosave.subscribe({
       onSaved: (edit, result) => {
         if (!isOurs(edit)) return;
@@ -145,6 +172,7 @@ export function usePb1(year: number, row: number, tab: string, onUnauthorized: (
           let next: Pb1Data = {
             ...patchCell(prev, result.row, result.column, { edited: result.edited }),
             loss: result.loss ?? undefined,
+            results: result.results ?? prev.results,
           };
           // Computed cells of the tab the change was made in (the page reloads on a tab switch).
           if (edit.pb1?.tab === prev.tab) {
@@ -168,10 +196,12 @@ export function usePb1(year: number, row: number, tab: string, onUnauthorized: (
       if (!cell?.editable) return;
       // Show the change at once; the queue sends it (amount: this company, else every company).
       setData((prev) => prev && patchCell(prev, cellRow, column, { value, edited: true }));
-      enqueue({ year, row: cellRow, column, value, pb1: { company: row, tab, shared: !cell.amount } });
+      const shown = dataRef.current?.report ?? "preliminary";
+      enqueue({ year, row: cellRow, column, value, pb1: { company: row, tab, shared: !cell.amount, report: shown } });
     },
     [enqueue, year, row, tab],
   );
 
-  return { data, loading, error, onCommit, autosave };
+  const reload = useCallback(() => setReloadKey((k) => k + 1), []);
+  return { data, loading, error, onCommit, autosave, reload };
 }

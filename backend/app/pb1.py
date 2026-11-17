@@ -1,7 +1,8 @@
 """PB-1 detail page API.
 
-Every company gets the same PB-1 table (template from "<year> PB-1.xls"). The amounts
-from the file are shown only for the company the file belongs to.
+Every company gets the same PB-1 table: the year's form (app.pb1_store: the imported snapshot
+of "<year> PB-1.xls" in PostgreSQL, or the form of the year a constructed year was built from).
+The amounts from the file are shown only for the company the file belongs to.
 
 That company is found through a stored link to its identity (pb1_link: the company-list
 row; in the database the company_year), never through its current name or PIB, which can
@@ -12,8 +13,8 @@ the PB-1 file is replaced by one for a different company.
 
 Fields can be edited (save_pb1_cell, used by the API and meant for automated filling too),
 except the read-only ones (pb1_edit_kind) and the computed ones. Amounts are saved for the
-company; template fields (comments, konto, ...) are shared by every company. Edits are kept in
-SQLite (edits.db, also in PostgreSQL mode for now); the PB-1 workbook is never written.
+company; template fields (comments, konto, ...) are shared by every company. Edits and settings
+are kept by app.pb1_store in PostgreSQL; no workbook is read or written.
 
 Cells that hold a formula in the workbook are computed with that formula from the current
 values (app.pb1_formulas), across the three tabs, and are read-only.
@@ -22,32 +23,29 @@ Tax loss (LOSS_RULES): when a tax base (Poreska osnovica) is negative, the compa
 loss: the tax of that base is 0 and read-only, so the monthly advance (a formula of the tax)
 is 0 too. The Poreski bilans base decides the "Gubitak!" banner (Pb1Table.loss).
 
-Comments (Poreski bilans, column "Komentar, stopa, konto"): one per row and company, shown
-beside the table. The defaults come from the settings (pb1_comment_defaults, filled once from
-the workbook); a company's own comment replaces its default for that company only. Numeric
-comments (the rates of lines 22-25) are inputs of the formulas.
+Comments (Poreski bilans, column "Komentar, stopa, konto"): global only (user's rule,
+2026-11-15): one comment per form row, the same for every year and company (pb1_comment,
+filled once from the workbook), shown beside the table read-only and edited only on the Global
+Settings page (app.global_settings). There are no year or company comments. Numeric comments (the rates
+of lines 22-25) are inputs of the formulas, so they are the same for every company too.
 """
 
 import math
+from decimal import ROUND_HALF_UP, Decimal
 import re
 from dataclasses import dataclass
+from datetime import datetime
 from typing import Literal
 
-from pathlib import Path
 from urllib.parse import quote
 
 from fastapi import APIRouter, Depends, HTTPException, Response, status
 from pydantic import BaseModel
-from sqlalchemy import select
-
-from app import edits_store
 from app.auth import require_user
-from app.db import database_enabled, session_scope
 from app.gfi_store import Edits, GfiStore, get_gfi_store
-from app.gfi_workbook import SourceTable
+from app.gfi_table import SourceTable
 from app.logging_config import get_logger
-from app.models import SourceFile
-from app.pb1_formulas import FORMULAS, Calculator, result_value, split_address, verify_formulas
+from app.pb1_formulas import FORMULAS, Calculator, result_value, split_address, unverified_formulas, verify_formulas
 from app.pb1_pdf import build_pb1_pdf
 from app.pb1_workbook import (
     DEFAULT_TAB,
@@ -56,11 +54,9 @@ from app.pb1_workbook import (
     Pb1Cell,
     Pb1Sheet,
     Pb1Workbook,
-    find_pb1_workbook,
-    load_pb1_workbook,
     normalize_company_name,
 )
-from app.reporting_years import get_data_dir
+from app.pb1_store import FINAL, PRELIMINARY, CompanyKey, Pb1Store, Pb1StoreError, ReportState, TabEdits, get_pb1_store
 
 logger = get_logger(__name__)
 
@@ -78,6 +74,8 @@ class Company(BaseModel):
 
 class Pb1Column(BaseModel):
     key: str
+    dash_empty: bool = False  # an empty field is shown as "-" (Konto); "-" entered means empty
+    overrun: bool = False  # a positive value is an overrun, shown red (Prekoracenje)
     header: str | None
     width: int  # characters, from the Excel sheet
     wrap: bool = False  # long descriptions wrap
@@ -96,6 +94,8 @@ class Pb1CellOut(BaseModel):
     edited: bool = False  # changed in the app (amount: for this company; template: for all companies)
     fill: str | None = None  # fill color from the sheet ("#rrggbb"; head rows only)
     formula: bool = False  # computed with the workbook's formula (read-only)
+    red: bool = False  # shown red although positive (an overrun in Prekoracenje)
+    green: bool = False  # shown green although negative (under the limit in Prekoracenje)
 
 
 class Pb1RowOut(BaseModel):
@@ -131,6 +131,15 @@ class Pb1Table(BaseModel):
     # description-comment pairs, one per row, each company its own.
     comment_column: str | None = None
     loss: Pb1Loss | None = None  # tax loss: the Poreski bilans tax base is negative ("Gubitak!")
+    results: Pb1Results | None = None  # accounting and tax result (Poreski bilans)
+    # The company's two reports (user, 2026-11-17): which one this is, and where they stand.
+    report: Literal["preliminary", "final"] = "preliminary"
+    preliminary_done: bool = False  # the preliminary report is done (locked, still viewable)
+    gfi_done: bool = False  # GFI is done: the final report can be created
+    final_created: bool = False  # the final report has been created from the preliminary one
+    final_done: bool = False  # the final report is done (locked until unlocked)
+    submitted_at: datetime | None = None  # the report is submitted (date and time)
+    locked: bool = False  # nothing can be changed in this report (done, or not created yet)
 
 
 class Pb1CellUpdate(BaseModel):
@@ -141,6 +150,20 @@ class Pb1ComputedCell(BaseModel):
     row: int  # Excel row of the form
     column: str
     value: CellValue
+
+
+class Pb1Result(BaseModel):
+    """A result of the form: its amount and whether it is a profit, a loss or zero."""
+
+    value: float  # rounded to two decimals
+    status: Literal["profit", "loss", "zero"]
+
+
+class Pb1Results(BaseModel):
+    """The two results shown beside the closing rows of Poreski bilans (user, 2026-11-17)."""
+
+    accounting: Pb1Result  # Knjigovodstveni rezultat: Klasa 6 - Klasa 5
+    tax: Pb1Result  # Poreski rezultat: Poreska osnovica (its loss: tax and monthly advance are 0)
 
 
 class Pb1Loss(BaseModel):
@@ -158,9 +181,10 @@ class Pb1CellUpdateResult(BaseModel):
     # The tab's computed cells after the change (formulas follow their inputs at once).
     computed: list[Pb1ComputedCell] = []
     loss: Pb1Loss | None = None  # tax loss after the change (the page reloads when it changes)
+    results: Pb1Results | None = None  # the results after the change
 
 
-Pb1EditKind = Literal["amount", "number", "text", "comment", "months"]
+Pb1EditKind = Literal["amount", "number", "text", "months"]
 # A company's number of months in business: whole months of one year.
 MONTHS_RANGE = range(1, 13)
 # For now the months in business are fixed (the file's 12, read-only for every company); they
@@ -184,7 +208,7 @@ class Pb1Form:
     year: int
     tab: str
     company: "Company"
-    company_key: tuple[str, int]  # (GFI workbook, GFI row): the company's identity for its amounts
+    company_key: CompanyKey  # (GFI workbook, GFI row): the company's identity for its amounts
     pb1: Pb1Workbook
     sheet: Pb1Sheet
     has_values: bool
@@ -192,6 +216,18 @@ class Pb1Form:
     # Migracija page) the year it was built from; then the form is empty for every company and
     # the years written in its texts are moved on by the difference.
     template_year: int = 0
+    store: Pb1Store | None = None  # where the form's edits and settings are kept
+    # Which of the company's two reports (preliminary, final), and where they stand.
+    report: str = PRELIMINARY
+    state: ReportState = ReportState()
+
+    @property
+    def locked(self) -> bool:
+        """Nothing can be changed: the preliminary report once done, the final one until created
+        and while marked as done."""
+        if self.report == PRELIMINARY:
+            return self.state.preliminary_done
+        return not self.state.final_created or self.state.final_done
 
 
 def _is_number(value: CellValue) -> bool:
@@ -205,14 +241,22 @@ def pb1_edit_kind(sheet: Pb1Sheet, row: int, column: str, cell: Pb1Cell) -> Pb1E
     columns are numbers, elsewhere texts."""
     spec = sheet.spec
     if column == spec.comment_column and row > sheet.head_end:
-        return "comment"  # the company's own comment (a number for a rate)
+        return None  # a global comment: edited only on the Global Settings page
+    if cell.dropped or cell.hidden:
+        return None  # not part of the form / not shown (section rows, hidden columns of the closing rows)
+    if column in spec.konto_columns and row > sheet.head_end:
+        return "text"  # Konto: any text or number, kept as typed (shared by every company)
+    if sheet.summary_start is not None and row >= sheet.summary_start:
+        # The closing rows (the box at the top): only their amount fields (user, 2026-11-16:
+        # the field of "V. Poreska osnovica"; the others are formulas).
+        return "amount" if cell.amount else None
     if row <= sheet.head_end:
         # Head rows above the form: only their numbers can be edited (amounts per company; the
         # form's constants, e.g. 12 months, for every company).
         if cell.amount:
             return "amount"
         return "months" if MONTHS_EDITABLE and (row, column) == spec.months_cell else None
-    if column in spec.narrow_columns or column in spec.readonly_columns:
+    if column in spec.narrow_columns or column in spec.readonly_columns or (row, column) in spec.readonly_cells:
         return None
     if spec.readonly_top is not None and row <= spec.readonly_top[0] and column in spec.readonly_top[1]:
         return None
@@ -221,6 +265,23 @@ def pb1_edit_kind(sheet: Pb1Sheet, row: int, column: str, cell: Pb1Cell) -> Pb1E
     if _is_number(cell.value) or (cell.value is None and column in spec.value_columns):
         return "number"
     return "text"
+
+
+CENT = Decimal("0.01")
+
+
+# An amount whose format writes negatives in parentheses, e.g. "#,##0.00_);[Red](#,##0.00)":
+# shown like every other amount, with a minus sign (user, 2026-11-16).
+PARENTHESES_NEGATIVE = re.compile(r";[^;]*\(")
+AMOUNT_FORMAT = "#,##0.00;[Red]-#,##0.00"
+
+
+def _shown_format(cell: Pb1Cell) -> str | None:
+    """The cell's number format as sent to the page (None for General); amounts never use
+    parentheses for negatives."""
+    if cell.amount and PARENTHESES_NEGATIVE.search(cell.number_format or ""):
+        return AMOUNT_FORMAT
+    return None if cell.number_format == "General" else cell.number_format
 
 
 def _same_value(kind: Pb1EditKind, value: CellValue, original: CellValue) -> bool:
@@ -251,7 +312,7 @@ def _company_at(source: SourceTable, edits: Edits, row: int) -> Company:
     cells = source.rows.get(row)
     original_name = cells[name_col].value if cells and name_col else None
     if not isinstance(original_name, str) or not original_name.strip():
-        raise HTTPException(status.HTTP_404_NOT_FOUND, f"No company in row {row}")
+        raise HTTPException(status.HTTP_404_NOT_FOUND, f"U redu {row} nema firme.")
 
     def current(col: str | None) -> CellValue:
         if col is None:
@@ -305,63 +366,58 @@ def pb1_owner_row(store: GfiStore, year: int, source: SourceTable, pb1: Pb1Workb
     return row
 
 
-def load_pb1_form(year: int, row: int, tab: str, user: str) -> Pb1Form:
-    """The company's PB-1 form tab; raises Pb1EditError (404/500) when it can't be loaded."""
+def load_pb1_form(
+    year: int, row: int, tab: str, user: str, store: Pb1Store | None = None, report: str | None = None
+) -> Pb1Form:
+    """The company's PB-1 form tab in one of its reports (None: the final one once the
+    preliminary one is done, else the preliminary one); raises Pb1EditError (404/500) when it
+    can't be loaded."""
     if tab not in {spec.key for spec in PB1_TABS}:
-        raise Pb1EditError(status.HTTP_404_NOT_FOUND, f"Unknown PB-1 tab {tab!r}")
-    # Company details come from the GFI data (PostgreSQL or Excel); PB-1 itself is still read from Excel.
-    store = get_gfi_store()
-    source, edits = store.load(year)
+        raise Pb1EditError(status.HTTP_404_NOT_FOUND, f"Nepoznat PB-1 tab: {tab}.")
+    if report not in (None, PRELIMINARY, FINAL):
+        raise Pb1EditError(status.HTTP_404_NOT_FOUND, f"Nepoznat PB-1 izveštaj: {report}.")
+    store = store or get_pb1_store()
+    # Company details come from the GFI data.
+    gfi = get_gfi_store()
+    source, edits = gfi.load(year)
     try:
         company = _company_at(source, edits, row)
     except HTTPException as exc:
         raise Pb1EditError(exc.status_code, str(exc.detail)) from None
 
-    template = pb1_template(year)
+    try:
+        template = store.template(year)
+    except Exception:
+        logger.exception("Failed to load the PB-1 form of %s (%s)", year, store.name)
+        raise Pb1EditError(status.HTTP_500_INTERNAL_SERVER_ERROR, "PB-1 obrazac nije mogao da se učita.") from None
     if template is None:
         logger.warning("No PB-1 form for reporting year %s", year)
-        raise Pb1EditError(status.HTTP_404_NOT_FOUND, f"No PB-1 form for reporting year {year}")
-    path, template_year = template
-    try:
-        pb1 = load_pb1_workbook(path)
-    except Exception:
-        logger.exception("Failed to read PB-1 workbook %s", path.name)
-        raise Pb1EditError(status.HTTP_500_INTERNAL_SERVER_ERROR, "Unable to read the PB-1 workbook") from None
+        raise Pb1EditError(status.HTTP_404_NOT_FOUND, f"Za godinu {year} nema PB-1 obrasca.")
+    pb1, template_year = template
 
     sheet = pb1.sheets.get(tab)
     if sheet is None:
-        raise Pb1EditError(status.HTTP_404_NOT_FOUND, f"The PB-1 workbook has no {tab!r} sheet")
+        raise Pb1EditError(status.HTTP_404_NOT_FOUND, f"PB-1 obrazac nema tab {tab}.")
     # The file's amounts belong to one company of the file's own year, found by its identity
     # (stored link). A form built from another year's file has no amounts for anyone.
-    has_values = template_year == year and pb1_owner_row(store, year, source, pb1, user) == row
+    company_key = (source.workbook, row)
+    state = store.report_state(year, company_key)
+    if report is None:
+        report = FINAL if state.preliminary_done else PRELIMINARY
+    # The final report holds only its own copy (pb1_company_edit), never the file's amounts.
+    has_values = (
+        report == PRELIMINARY and template_year == year and pb1_owner_row(gfi, year, source, pb1, user) == row
+    )
     return Pb1Form(
-        year=year, tab=tab, company=company, company_key=(source.workbook, row),
-        pb1=pb1, sheet=sheet, has_values=has_values, template_year=template_year,
+        year=year, tab=tab, company=company, company_key=company_key,
+        pb1=pb1, sheet=sheet, has_values=has_values, template_year=template_year, store=store,
+        report=report, state=state,
     )
 
 
-def pb1_template(year: int) -> tuple[Path, int] | None:
-    """The PB-1 workbook used as the form of `year` and the year of that workbook: the year's
-    own "<year> PB-1.xls", or, for a year constructed on the Migracija page (a constructed
-    'pb1' source_file), the form of the year it was built from (followed back to a workbook)."""
-    seen: set[int] = set()
-    while year not in seen:
-        seen.add(year)
-        path = find_pb1_workbook(get_data_dir(), year)
-        if path is not None:
-            return path, year
-        if not database_enabled():
-            return None
-        with session_scope() as session:
-            based_on = session.scalar(
-                select(SourceFile.based_on_year).where(
-                    SourceFile.kind == "pb1", SourceFile.year == year, SourceFile.origin == "constructed"
-                )
-            )
-        if based_on is None:
-            return None
-        year = based_on
-    return None
+def pb1_template(year: int) -> tuple[Pb1Workbook, int] | None:
+    """The PB-1 form of `year` and the year of the workbook it comes from (see app.pb1_store)."""
+    return get_pb1_store().template(year)
 
 
 _YEAR = re.compile(r"(?<!\d)(20\d\d)(?!\d)")
@@ -375,56 +431,16 @@ def shift_years(value: CellValue, delta: int) -> CellValue:
     return _YEAR.sub(lambda m: str(int(m.group(1)) + delta), value)
 
 
-# (template edits shared by every company, this company's edits: amounts and comments,
-#  the default comments of the tab: row -> value) of one tab
-TabEdits = tuple[edits_store.Pb1Edits, edits_store.Pb1Edits, dict[int, CellValue]]
-
-_seeded_comments: set[tuple[int, str]] = set()  # (year, PB-1 workbook) whose defaults are stored
-
-
-def _comment_value(cell: Pb1Cell) -> CellValue:
-    """A comment as stored in the settings: a rate (number in a percent format) stays a number,
-    the formulas use it; anything else is text (konto numbers such as 670 included)."""
-    value = cell.value
-    if _is_number(value):
-        if "%" in cell.number_format:
-            return value
-        return str(int(value)) if float(value).is_integer() else str(value)
-    if isinstance(value, str) and value.strip():
-        return value.strip()
-    return None
-
-
-def comment_defaults(year: int, pb1: Pb1Workbook, tab: str, user: str) -> dict[int, CellValue]:
-    """The default comments of a tab (settings). The first time a workbook is used, the comments
-    written in it are stored as the defaults of the rows that have none yet."""
-    if (year, pb1.workbook) not in _seeded_comments:
-        for key, sheet in pb1.sheets.items():
-            column = sheet.spec.comment_column
-            if column is None:
-                continue
-            values = {
-                row: _comment_value(cells[column])
-                for row, cells in sheet.rows.items()
-                if row > sheet.head_end and column in cells and _comment_value(cells[column]) is not None
-            }
-            added = edits_store.seed_pb1_comment_defaults(year, pb1.workbook, key, values, user)
-            if added:
-                logger.info("PB-1 comment defaults of %s (%s) stored from the workbook: %d", pb1.workbook, key, added)
-        _seeded_comments.add((year, pb1.workbook))
-    if pb1.sheets.get(tab) is None or pb1.sheets[tab].spec.comment_column is None:
-        return {}
-    return edits_store.get_pb1_comment_defaults(year, pb1.workbook, tab)
-
-# PB-1 workbook name -> (the loaded workbook, its computed cells per tab: {(row, column)})
-_computed_cache: dict[str, tuple[Pb1Workbook, dict[str, set[tuple[int, str]]]]] = {}
+# id of a loaded form -> (the form, its computed cells per tab: {(row, column)}). A form is
+# loaded once and kept (app.pb1_store caches it), so this holds only a few entries.
+_computed_cache: dict[int, tuple[Pb1Workbook, dict[str, set[tuple[int, str]]]]] = {}
 
 
 def computed_cells(pb1: Pb1Workbook) -> dict[str, set[tuple[int, str]]]:
     """The form cells computed with the workbook's formulas, per tab: amount fields that hold a
     formula. Empty when the formulas don't reproduce Excel's stored results for this workbook
     (then the file's values are shown and can be edited, as without formulas)."""
-    cached = _computed_cache.get(pb1.workbook)
+    cached = _computed_cache.get(id(pb1))
     if cached is not None and cached[0] is pb1:
         return cached[1]
     cells: dict[str, set[tuple[int, str]]] = {}
@@ -437,7 +453,11 @@ def computed_cells(pb1: Pb1Workbook) -> dict[str, set[tuple[int, str]]]:
             cell = sheet.rows.get(row, {}).get(column)
             if cell is not None and cell.amount and column in sheet.spec.columns:
                 cells.setdefault(tab, set()).add((row, column))
-    mismatches = verify_formulas(pb1.raw, {tab: set(FORMULAS[tab]) for tab in pb1.sheets if tab in FORMULAS})
+    unverified = unverified_formulas()
+    mismatches = verify_formulas(
+        pb1.raw,
+        {tab: set(FORMULAS[tab]) - unverified.get(tab, set()) for tab in pb1.sheets if tab in FORMULAS},
+    )
     if mismatches:
         logger.error(
             "PB-1 formulas don't match %s (%d differences, e.g. %s); computed cells are off for this workbook",
@@ -448,20 +468,13 @@ def computed_cells(pb1: Pb1Workbook) -> dict[str, set[tuple[int, str]]]:
         logger.info(
             "PB-1 formulas verified against %s: %d computed cells", pb1.workbook, sum(len(c) for c in cells.values())
         )
-    _computed_cache[pb1.workbook] = (pb1, cells)
+    _computed_cache[id(pb1)] = (pb1, cells)
     return cells
 
 
 def _all_edits(form: Pb1Form, user: str = "system") -> dict[str, TabEdits]:
-    """The edits and default comments of every tab of the form (the formulas reach across tabs)."""
-    return {
-        tab: (
-            edits_store.get_pb1_edits(form.year, form.pb1.workbook, tab, *edits_store.TEMPLATE_COMPANY),
-            edits_store.get_pb1_edits(form.year, form.pb1.workbook, tab, *form.company_key),
-            comment_defaults(form.year, form.pb1, tab, user),
-        )
-        for tab in form.pb1.sheets
-    }
+    """The edits and the comments of every tab of the form (the formulas reach across tabs)."""
+    return form.store.form_edits(form.year, form.pb1, form.company_key, user, form.report)
 
 
 def _cell_view(
@@ -474,12 +487,17 @@ def _cell_view(
     # Amount fields are empty for every company except the owner of the file; template
     # text in the amount columns (e.g. "RSD" in Preliminarni rezultat) stays for everyone.
     value = _shown_original(cell, form.has_values)
-    if kind == "comment":
-        value = defaults.get(row)  # the default comment (settings), for every company
+    if column == sheet.spec.comment_column and row > sheet.head_end:
+        return defaults.get(row), None, None  # the global comment of the row, for every company
     if (row, column) == sheet.spec.company_name_cell:
         value = form.company.name  # the name written in the file belongs to the file's company
-    own = kind in ("amount", "comment", "months")  # saved for the company
+    own = kind in ("amount", "months")  # saved for the company
     edit = (company_edits if own else template_edits).get((row, column)) if kind else None
+    if own and form.report == FINAL:
+        # The final report: its own stored copy; changed = differs from the copied value.
+        if edit is None:
+            return None, kind, None
+        return edit[0], kind, (None if _same_value(kind, edit[0], edit[1]) else edit)
     if edit is not None and _same_value(kind, edit[0], value):
         edit = None  # stored, but equal to what is shown (e.g. an empty amount over " ")
     if edit is not None:
@@ -513,6 +531,26 @@ def _loss(calc: Calculator) -> Pb1Loss | None:
     return Pb1Loss(base=base) if _negative(base) else None
 
 
+# Knjigovodstveni rezultat = Klasa 6 (D3) - Klasa 5 (C3); Poreski rezultat = Poreska osnovica.
+RESULT_CLASS_6 = ("poreski-bilans", "D3")
+RESULT_CLASS_5 = ("poreski-bilans", "C3")
+
+
+def _result(value: float) -> Pb1Result:
+    value = round(value, 2) + 0.0  # + 0.0: no "-0.0"
+    return Pb1Result(value=value, status="profit" if value > 0 else "loss" if value < 0 else "zero")
+
+
+def _results(calc: Calculator) -> Pb1Results:
+    def number(tab: str, address: str) -> float:
+        return result_value(calc.value(tab, address)) or 0.0
+
+    return Pb1Results(
+        accounting=_result(number(*RESULT_CLASS_6) - number(*RESULT_CLASS_5)),
+        tax=_result(number(*LOSS_BANNER_BASE)),
+    )
+
+
 def _calculator(form: Pb1Form, edits: dict[str, TabEdits]) -> Calculator:
     """Evaluates the formulas of this company's form. Inputs: form cells as shown (edits
     included); helper cells outside the form from the file for the file's company, else empty;
@@ -526,7 +564,8 @@ def _calculator(form: Pb1Form, edits: dict[str, TabEdits]) -> Calculator:
         sheet = form.pb1.sheets.get(tab)
         cell = sheet.rows.get(row, {}).get(column) if sheet and column in sheet.spec.columns else None
         if cell is not None:
-            return _cell_view(form, tab, row, column, cell, edits[tab])[0]
+            # A cell that is not part of the form (e.g. a section row's amount) is empty.
+            return None if cell.dropped else _cell_view(form, tab, row, column, cell, edits[tab])[0]
         return form.pb1.raw.get(tab, {}).get(address) if form.has_values else None
 
     calc = Calculator(input_value)
@@ -558,27 +597,35 @@ def build_pb1_table(form: Pb1Form) -> Pb1Table:
     for row_number, cells in sheet.rows.items():
         out = {}
         for key, cell in cells.items():
+            if cell.dropped or cell.hidden:
+                out[key] = Pb1CellOut()  # not part of the form / not shown here: empty, read-only
+                continue
             formula = (row_number, key) in computed or _loss_zeroed(calc, form.tab, f"{key}{row_number}")
             if formula:
                 # Computed with the workbook's formula from the current values; read-only.
                 value, kind, edit = result_value(calc.value(form.tab, f"{key}{row_number}")), None, None
             else:
                 value, kind, edit = _cell_view(form, form.tab, row_number, key, cell, edits[form.tab])
-                if kind is None and (row_number, key) != sheet.spec.company_name_cell:
+                is_comment = key == comment_column and row_number > sheet.head_end
+                if kind is None and not is_comment and (row_number, key) != sheet.spec.company_name_cell:
                     value = shift_years(value, delta)
-                if kind == "comment":
-                    # A rate is edited as a number (the formulas use it), any other comment as text.
-                    kind = "number" if _is_number(value) or _is_number(edits[form.tab][2].get(row_number)) else "text"
             out[key] = Pb1CellOut(
                 value=value,
-                format=None if cell.number_format == "General" else cell.number_format,
-                bold=cell.bold,
+                format=_shown_format(cell),
+                # Numbers in normal weight where the tab says so (Poreski bilans); texts keep bold.
+                bold=cell.bold
+                and not (sheet.spec.plain_numbers and (cell.amount or _is_number(value)))
+                and (row_number, key) not in sheet.spec.plain_cells,
                 amount=cell.amount,
-                editable=kind is not None,
+                editable=kind is not None and not form.locked,
                 number=kind in ("amount", "number", "months"),
                 edited=edit is not None,
                 fill=cell.fill,
                 formula=formula,
+                red=key == sheet.spec.overrun_column and row_number > sheet.head_end
+                and _is_number(value) and float(value) > 0,
+                green=key == sheet.spec.overrun_column and row_number > sheet.head_end
+                and _is_number(value) and float(value) < 0,
             )
         description = cells.get("B")
         shaded = row_number > sheet.head_end and bool(
@@ -587,6 +634,8 @@ def build_pb1_table(form: Pb1Form) -> Pb1Table:
         rows.append(Pb1RowOut(row=row_number, cells=out, shaded=shaded))
     start = sheet.summary_start
     head = [r for r in rows if r.row <= sheet.head_end]
+    if sheet.spec.head_result and len(head) >= 2:
+        head.append(_head_result_row(form, calc, head))
     summary = [r for r in rows if start is not None and r.row >= start]
     rows = [r for r in rows if r.row > sheet.head_end and (start is None or r.row < start)]
 
@@ -594,7 +643,8 @@ def build_pb1_table(form: Pb1Form) -> Pb1Table:
         return Pb1Column(
             key=k, header=shift_years(sheet.headers.get(k), delta), width=sheet.column_widths[k],
             wrap=k in sheet.spec.wrap_columns, amount=k in sheet.spec.value_columns,
-            narrow=k in sheet.spec.narrow_columns,
+            narrow=k in sheet.spec.narrow_columns, dash_empty=k in sheet.spec.konto_columns,
+            overrun=k == sheet.spec.overrun_column,
         )
 
     # The comment column is shown beside the table (description-comment pairs), not in it.
@@ -606,80 +656,133 @@ def build_pb1_table(form: Pb1Form) -> Pb1Table:
         has_values=form.has_values,
         entered=len({k for k in company_edits if k[1] != comment_column} - computed),
         columns=columns, rows=rows, summary=summary, head=head, head_columns=head_columns,
-        comment_column=comment_column, loss=_loss(calc),
+        comment_column=comment_column, loss=_loss(calc), results=_results(calc),
+        report=form.report, preliminary_done=form.state.preliminary_done, gfi_done=form.state.gfi_done,
+        final_created=form.state.final_created, final_done=form.state.final_done,
+        submitted_at=form.state.submitted_at, locked=form.locked,
+    )
+
+
+def _head_result_row(form: Pb1Form, calc: Calculator, head: list[Pb1RowOut]) -> Pb1RowOut:
+    """The extra head row (spec.head_result): a label under the first class label (fill of the
+    label row above) and the computed value under the second (its own fill); read-only."""
+    label, address, label_column, value_column, value_fill = form.sheet.spec.head_result
+    labels, values = head[-2].cells, head[-1].cells
+    value_cell = values.get(value_column) or Pb1CellOut()
+    return Pb1RowOut(
+        row=form.sheet.head_end + 1,
+        cells={
+            label_column: Pb1CellOut(value=label, fill=(labels.get(label_column) or Pb1CellOut()).fill),
+            value_column: Pb1CellOut(
+                value=result_value(calc.value(form.tab, address)), format=value_cell.format, amount=True,
+                formula=True, fill=value_fill,
+            ),
+        },
     )
 
 
 def save_pb1_cell(
-    year: int, row: int, tab: str, cell_row: int, column: str, value: float | str | None, user: str
+    year: int, row: int, tab: str, cell_row: int, column: str, value: float | str | None, user: str,
+    report: str | None = None,
 ) -> Pb1CellUpdateResult:
-    """Saves one field of a company's PB-1 form: the service behind the API, also meant for
-    automated filling. Amounts are saved for the company, template fields for every company.
-    Saving the value shown before any edit removes the edit. Raises Pb1EditError."""
-    form = load_pb1_form(year, row, tab, user)
+    """Saves one field of a company's PB-1 form in one of its reports (see load_pb1_form): the
+    service behind the API, also meant for automated filling. Amounts are saved for the company
+    and report, template fields for every company. Saving the value shown before any edit
+    removes the edit (in the final report the copied value is kept). Raises Pb1EditError."""
+    form = load_pb1_form(year, row, tab, user, report=report)
+    if form.locked:
+        raise Pb1EditError(
+            status.HTTP_409_CONFLICT,
+            "Preliminarni izveštaj je gotov i više se ne menja." if form.report == PRELIMINARY
+            else "Konačni izveštaj je gotov i zaključan; otključajte ga za izmene." if form.state.final_done
+            else "Konačni izveštaj još nije napravljen.",
+        )
     cell = form.sheet.rows.get(cell_row, {}).get(column)
     if cell is None:
-        raise Pb1EditError(status.HTTP_404_NOT_FOUND, f"PB-1 field {column}{cell_row} not found in {tab!r}")
+        raise Pb1EditError(status.HTTP_404_NOT_FOUND, f"PB-1 polje {column}{cell_row} ne postoji na tabu {tab}.")
     if (cell_row, column) in computed_cells(form.pb1).get(tab, set()):
-        raise Pb1EditError(status.HTTP_409_CONFLICT, f"PB-1 field {column}{cell_row} is computed by a formula")
+        raise Pb1EditError(status.HTTP_409_CONFLICT, f"PB-1 polje {column}{cell_row} se računa formulom.")
     kind = pb1_edit_kind(form.sheet, cell_row, column, cell)
     if kind is None:
-        raise Pb1EditError(status.HTTP_409_CONFLICT, f"PB-1 field {column}{cell_row} is read-only")
+        raise Pb1EditError(status.HTTP_409_CONFLICT, f"PB-1 polje {column}{cell_row} je samo za čitanje.")
     edits = _all_edits(form, user)
     if _loss_zeroed(_calculator(form, edits), tab, f"{column}{cell_row}"):
-        raise Pb1EditError(status.HTTP_409_CONFLICT, f"PB-1 field {column}{cell_row} is 0: the tax base is negative (tax loss)")
-    original = (
-        _cell_view(form, tab, cell_row, column, cell, (*edits[tab][:1], {}, edits[tab][2]))[0]
-        if kind == "comment" else _shown_original(cell, form.has_values)
-    )
-    # A comment is a number when its default is (a rate), else text.
-    value_kind = ("number" if _is_number(original) else "text") if kind == "comment" else kind
+        raise Pb1EditError(status.HTTP_409_CONFLICT, f"PB-1 polje {column}{cell_row} je 0: poreska osnovica je negativna (gubitak).")
+    original = _shown_original(cell, form.has_values)
+    shared = kind not in ("amount", "months")  # the company's own values
+    stored = None
+    if not shared and form.report == FINAL:
+        # The final report's own copy: its value before any edit is the copied one.
+        stored = edits[tab][1].get((cell_row, column))
+        original = stored[1] if stored is not None else None
+    value_kind = kind
+    konto = column in form.sheet.spec.konto_columns
+    if konto:
+        # Konto: any text or number, kept as typed (user, 2026-11-16); "-" or only spaces is empty.
+        value_kind = "text"
+        if _is_number(original):
+            original = str(int(original)) if float(original).is_integer() else str(original)
     if kind == "months":
         # Monthly advance = tax / months in business: whole months of one year (empty = default).
         if value is not None and (isinstance(value, str) or not float(value).is_integer() or int(value) not in MONTHS_RANGE):
-            raise Pb1EditError(status.HTTP_422_UNPROCESSABLE_CONTENT, "Months in business must be a whole number from 1 to 12")
+            raise Pb1EditError(status.HTTP_422_UNPROCESSABLE_CONTENT, "Broj meseci poslovanja mora biti ceo broj od 1 do 12.")
         value = int(value) if value is not None else original
     elif value_kind in ("amount", "number"):
         if isinstance(value, str) or (value is not None and not math.isfinite(value)):
-            raise Pb1EditError(status.HTTP_422_UNPROCESSABLE_CONTENT, "Value must be a finite number")
+            raise Pb1EditError(status.HTTP_422_UNPROCESSABLE_CONTENT, "Vrednost mora biti broj.")
+        if value is not None and value_kind == "amount":
+            # Amounts are kept with two decimals (user, 2026-11-16), half up as in the editor
+            # (round() would give 1000.55 for 1000.555: binary floats).
+            value = float(Decimal(repr(float(value))).quantize(CENT, rounding=ROUND_HALF_UP))
         if value is not None and float(value).is_integer():
             value = int(value)
     else:
+        if konto and _is_number(value):
+            value = str(int(value)) if float(value).is_integer() else str(value)
         if value is not None and not isinstance(value, str):
-            raise Pb1EditError(status.HTTP_422_UNPROCESSABLE_CONTENT, "Value must be text")
+            raise Pb1EditError(status.HTTP_422_UNPROCESSABLE_CONTENT, "Vrednost mora biti tekst.")
         value = (" ".join(value.split()) or None) if value is not None else None
+        if konto and value == "-":
+            value = None
 
-    shared = kind not in ("amount", "comment", "months")  # the company's own values
-    company = edits_store.TEMPLATE_COMPANY if shared else form.company_key
-    key = (year, form.pb1.workbook, tab, cell_row, column, *company)
+    company = None if shared else form.company_key
+    key = (year, form.pb1, tab, cell_row, column, company)
     edited = not _same_value(kind, value, original)
-    if edited:
-        edits_store.save_pb1_edit(*key, value, original, user)
-    else:
-        edits_store.delete_pb1_edit(*key)
+    report_of = {} if shared else {"report": form.report}
+    try:
+        if edited or stored is not None:
+            # A final report value stays stored (it is the report's copy), also when changed back.
+            form.store.save_edit(*key, value, original, user, **report_of)
+        else:
+            form.store.delete_edit(*key, **report_of)
+    except Pb1StoreError as exc:
+        raise Pb1EditError(status.HTTP_404_NOT_FOUND, str(exc)) from None
     logger.info(
         "PB-1 %s %s%d %s by '%s' (%s)", tab, column, cell_row, "edited" if edited else "reverted", user,
-        "all companies" if shared else f"company row {row}",
+        "all companies" if shared else f"company row {row}, {form.report} report",
     )
     logger.debug("PB-1 %s %s%d new value: %r", tab, column, cell_row, value)
     calc = _calculator(form, _all_edits(form))
     return Pb1CellUpdateResult(
         row=cell_row, column=column, value=value, edited=edited, shared=shared,
-        computed=_computed_values(form, calc), loss=_loss(calc),
+        computed=_computed_values(form, calc), loss=_loss(calc), results=_results(calc),
     )
 
 
 @router.get("/pb1", response_model_exclude_defaults=True)
 @router.get("/pb1/{tab}", response_model_exclude_defaults=True)
-def get_pb1(year: int, row: int, tab: str = DEFAULT_TAB, username: str = Depends(require_user)) -> Pb1Table:
-    """One tab of the company's PB-1 form (default: Poreski bilans), with the edits applied."""
+def get_pb1(
+    year: int, row: int, tab: str = DEFAULT_TAB, report: str | None = None, username: str = Depends(require_user)
+) -> Pb1Table:
+    """One tab of the company's PB-1 form (default: Poreski bilans) in one of its reports
+    (default: see load_pb1_form), with the edits applied."""
     try:
-        form = load_pb1_form(year, row, tab, username)
+        form = load_pb1_form(year, row, tab, username, report=report)
     except Pb1EditError as exc:
         raise HTTPException(exc.status_code, str(exc)) from None
     table = build_pb1_table(form)
     logger.info(
-        "PB-1 %s for '%s' (row %d, %s): %s, %d entered", tab, form.company.name, row, year,
+        "PB-1 %s %s for '%s' (row %d, %s): %s, %d entered", form.report, tab, form.company.name, row, year,
         "values" if form.has_values else "empty template", table.entered,
     )
     return table
@@ -688,11 +791,11 @@ def get_pb1(year: int, row: int, tab: str = DEFAULT_TAB, username: str = Depends
 @router.put("/pb1/{tab}/cells/{column}/{cell_row}")
 def update_pb1_cell(
     year: int, row: int, tab: str, column: str, cell_row: int, update: Pb1CellUpdate,
-    username: str = Depends(require_user),
+    report: str | None = None, username: str = Depends(require_user),
 ) -> Pb1CellUpdateResult:
     """Saves one field of the company's PB-1 form (see save_pb1_cell)."""
     try:
-        return save_pb1_cell(year, row, tab, cell_row, column, update.value, username)
+        return save_pb1_cell(year, row, tab, cell_row, column, update.value, username, report=report)
     except Pb1EditError as exc:
         if exc.status_code < 500:
             logger.warning("Rejected PB-1 edit %s %s%d by '%s': %s", tab, column, cell_row, username, exc)
@@ -700,13 +803,16 @@ def update_pb1_cell(
 
 
 @router.get("/pb1-pdf")
-def get_pb1_pdf(year: int, row: int, inline: bool = False, username: str = Depends(require_user)) -> Response:
+def get_pb1_pdf(
+    year: int, row: int, inline: bool = False, report: str | None = None, username: str = Depends(require_user)
+) -> Response:
     """The company's PB-1 form as a PDF: the three tabs with their current values (edits,
-    formulas, comments). `inline`: shown in the browser (for printing) instead of downloaded."""
+    formulas; no comments). `inline`: shown in the browser ("Generate PDF report" opens it in a new
+    tab) instead of downloaded."""
     tables = []
     try:
         for spec in PB1_TABS:
-            form = load_pb1_form(year, row, spec.key, username)
+            form = load_pb1_form(year, row, spec.key, username, report=report)
             tables.append(build_pb1_table(form))
     except Pb1EditError as exc:
         if exc.status_code == status.HTTP_404_NOT_FOUND and spec.key != DEFAULT_TAB and tables:
@@ -715,14 +821,268 @@ def get_pb1_pdf(year: int, row: int, inline: bool = False, username: str = Depen
             raise HTTPException(exc.status_code, str(exc)) from None
     company = tables[0].company
     try:
-        pdf = build_pb1_pdf(tables, company.name, company.pib, year)
+        pdf = build_pb1_pdf(tables, company.name, company.pib, year, tables[0].report)
     except Exception:
         logger.exception("Failed to build the PB-1 PDF for row %d (%s)", row, year)
-        raise HTTPException(status.HTTP_500_INTERNAL_SERVER_ERROR, "Unable to build the PDF") from None
-    name = re.sub(r'[\/:*?"<>|]+', " ", f"PB-1 {year} {company.name}").strip() + ".pdf"
+        raise HTTPException(status.HTTP_500_INTERNAL_SERVER_ERROR, "PDF nije mogao da se napravi.") from None
+    kind = "preliminary" if tables[0].report == PRELIMINARY else "final"
+    name = re.sub(r'[\/:*?"<>|]+', " ", f"PB-1 {year} {company.name} {kind}").strip() + ".pdf"
     disposition = "inline" if inline else "attachment"
     logger.info("PB-1 PDF for '%s' (row %d, %s) by '%s': %d bytes", company.name, row, year, username, len(pdf))
     return Response(
         pdf, media_type="application/pdf",
         headers={"Content-Disposition": f"{disposition}; filename*=UTF-8''{quote(name)}"},
     )
+
+
+# --- the two reports: preliminary done, final created (user, 2026-11-17) --------------------
+
+class Pb1ReportStateOut(BaseModel):
+    preliminary_done: bool
+    gfi_done: bool = False
+    final_created: bool
+    final_done: bool = False
+    submitted_at: datetime | None = None
+
+
+class Pb1ReportEventOut(BaseModel):
+    event: str  # preliminary_done, final_created, final_done, final_unlocked, submitted, submission_withdrawn
+    at: datetime
+    by: str
+
+
+# Home status columns the reports set (0 / 1): "Preliminarni" when the preliminary report is
+# done; "PB-1, PB-2" when the final report is done (back to 0 when it is unlocked).
+PRELIMINARY_FIELD = "preliminarni"
+GFI_FIELD = "gfi_uradjen"  # Home "GFI uradjen": 1 while GFI is marked as done
+FINAL_FIELD = "pb"
+SUBMITTED_FIELD = "pb_predat"  # Home "PB-1, PB-2 Predat": 1 while the report is submitted
+
+
+def _set_home_status(year: int, row: int, field: str, value: int, user: str) -> None:
+    """Sets one of the company's Home status columns (as an edit on Home would, with history)."""
+    gfi = get_gfi_store()
+    source, edits = gfi.load(year)
+    column = next((c for c, f in source.fields.items() if f == field), None)
+    src = source.rows.get(row, {}).get(column) if column else None
+    if src is None:
+        logger.warning("No %s cell for row %d (%s); Home not updated", field, row, year)
+        return
+    current = edits[(row, column)][0] if (row, column) in edits else src.value
+    if _is_number(current) and float(current) == value:
+        return
+    gfi.save(year, row, column, "number", value, src.value, user)
+    logger.info("Home %s of row %d (%s) set to %d by '%s' (PB-1 report)", field, row, year, value, user)
+
+
+def _state_out(state: ReportState) -> Pb1ReportStateOut:
+    return Pb1ReportStateOut(
+        preliminary_done=state.preliminary_done, gfi_done=state.gfi_done, final_created=state.final_created,
+        final_done=state.final_done,
+        submitted_at=state.submitted_at,
+    )
+
+
+def mark_preliminary_done(year: int, row: int, user: str) -> Pb1ReportStateOut:
+    """Marks the company's preliminary PB-1 report as done: locked from then on (still viewable),
+    the final report can be created, and Home "Preliminarni" becomes 1. Raises Pb1EditError."""
+    form = load_pb1_form(year, row, DEFAULT_TAB, user, report=PRELIMINARY)
+    if not form.state.preliminary_done:
+        try:
+            form.store.mark_preliminary_done(year, form.company_key, user)
+        except Pb1StoreError as exc:
+            raise Pb1EditError(status.HTTP_404_NOT_FOUND, str(exc)) from None
+        logger.info("PB-1 preliminary report of '%s' (row %d, %s) marked as done by '%s'", form.company.name, row, year, user)
+        _set_home_status(year, row, PRELIMINARY_FIELD, 1, user)
+    return _state_out(form.store.report_state(year, form.company_key))
+
+
+def set_gfi_done(year: int, row: int, done: bool, user: str) -> Pb1ReportStateOut:
+    """Marks the company's GFI as done (after the preliminary report; Home "GFI uradjen" = 1; the
+    final report can then be created) or reopens it (only before the final report exists; Home
+    "GFI uradjen" = 0). Raises Pb1EditError."""
+    form = load_pb1_form(year, row, DEFAULT_TAB, user, report=PRELIMINARY)
+    if not form.state.preliminary_done:
+        raise Pb1EditError(status.HTTP_409_CONFLICT, "Preliminarni izveštaj još nije označen kao gotov.")
+    if form.state.final_created:
+        raise Pb1EditError(status.HTTP_409_CONFLICT, "Konačni izveštaj je već napravljen; GFI se više ne otvara.")
+    if form.state.gfi_done != done:
+        try:
+            form.store.set_gfi_done(year, form.company_key, done, user)
+        except Pb1StoreError as exc:
+            raise Pb1EditError(status.HTTP_409_CONFLICT, str(exc)) from None
+        logger.info(
+            "GFI of '%s' (row %d, %s) %s by '%s'", form.company.name, row, year, "marked as done" if done else "reopened", user
+        )
+        _set_home_status(year, row, GFI_FIELD, 1 if done else 0, user)
+    return _state_out(form.store.report_state(year, form.company_key))
+
+
+def set_final_done(year: int, row: int, done: bool, user: str) -> Pb1ReportStateOut:
+    """Marks the company's final PB-1 report as done (locked; Home "PB-1, PB-2" = 1) or unlocks it
+    again for changes (Home "PB-1, PB-2" = 0): the inverse operation. Raises Pb1EditError."""
+    form = load_pb1_form(year, row, DEFAULT_TAB, user, report=FINAL)
+    if not form.state.final_created:
+        raise Pb1EditError(status.HTTP_409_CONFLICT, "Konačni izveštaj još nije napravljen.")
+    if form.state.submitted_at is not None:
+        raise Pb1EditError(status.HTTP_409_CONFLICT, "Izveštaj je predat; prvo povucite predaju.")
+    if form.state.final_done != done:
+        try:
+            form.store.set_final_done(year, form.company_key, done, user)
+        except Pb1StoreError as exc:
+            raise Pb1EditError(status.HTTP_409_CONFLICT, str(exc)) from None
+        logger.info(
+            "PB-1 final report of '%s' (row %d, %s) %s by '%s'", form.company.name, row, year,
+            "marked as done" if done else "unlocked", user,
+        )
+        _set_home_status(year, row, FINAL_FIELD, 1 if done else 0, user)
+    return _state_out(form.store.report_state(year, form.company_key))
+
+
+def _preliminary_values(year: int, row: int, user: str) -> dict[tuple[str, int, str], CellValue]:
+    """Every value of the company's own in the preliminary report, as shown: (tab, row, col) ->
+    value; formulas (computed) and empty fields left out."""
+    values: dict[tuple[str, int, str], CellValue] = {}
+    for spec in PB1_TABS:
+        try:
+            form = load_pb1_form(year, row, spec.key, user, report=PRELIMINARY)
+        except Pb1EditError as exc:
+            if exc.status_code == status.HTTP_404_NOT_FOUND and spec.key != DEFAULT_TAB:
+                continue  # a form without this tab
+            raise
+        edits = _all_edits(form, user)
+        computed = computed_cells(form.pb1).get(spec.key, set())
+        for cell_row, cells in form.sheet.rows.items():
+            for column, cell in cells.items():
+                if cell.dropped or cell.hidden or (cell_row, column) in computed:
+                    continue
+                value, kind, _ = _cell_view(form, spec.key, cell_row, column, cell, edits[spec.key])
+                if kind not in ("amount", "months"):
+                    continue
+                if kind == "amount" and not _is_number(value):
+                    continue  # an empty amount (also " " or an error in the file)
+                if value is None:
+                    continue
+                values[(spec.key, cell_row, column)] = value
+    return values
+
+
+def create_final_report(year: int, row: int, user: str) -> Pb1ReportStateOut:
+    """Creates the company's final PB-1 report from its preliminary one: every value is copied
+    into the database for the final report, which is separate from then on. Raises Pb1EditError."""
+    form = load_pb1_form(year, row, DEFAULT_TAB, user, report=PRELIMINARY)
+    if not form.state.preliminary_done:
+        raise Pb1EditError(status.HTTP_409_CONFLICT, "Preliminarni izveštaj još nije označen kao gotov.")
+    if form.state.final_created:
+        raise Pb1EditError(status.HTTP_409_CONFLICT, "Konačni izveštaj je već napravljen.")
+    if not form.state.gfi_done:
+        raise Pb1EditError(status.HTTP_409_CONFLICT, "GFI još nije označen kao gotov.")
+    values = _preliminary_values(year, row, user)
+    try:
+        copied = form.store.create_final(year, form.company_key, values, user)
+    except Pb1StoreError as exc:
+        raise Pb1EditError(status.HTTP_409_CONFLICT, str(exc)) from None
+    logger.info("PB-1 final report of '%s' (row %d, %s) created by '%s': %d values copied", form.company.name, row, year, user, copied)
+    return _state_out(form.store.report_state(year, form.company_key))
+
+
+@router.post("/pb1-report/preliminary-done")
+def post_preliminary_done(year: int, row: int, username: str = Depends(require_user)) -> Pb1ReportStateOut:
+    try:
+        return mark_preliminary_done(year, row, username)
+    except Pb1EditError as exc:
+        raise HTTPException(exc.status_code, str(exc)) from None
+
+
+@router.post("/pb1-report/final")
+def post_final_report(year: int, row: int, username: str = Depends(require_user)) -> Pb1ReportStateOut:
+    try:
+        return create_final_report(year, row, username)
+    except Pb1EditError as exc:
+        if exc.status_code < 500:
+            logger.warning("Rejected creating the final PB-1 report of row %d (%s) by '%s': %s", row, year, username, exc)
+        raise HTTPException(exc.status_code, str(exc)) from None
+
+
+@router.post("/pb1-report/final-done")
+def post_final_done(year: int, row: int, username: str = Depends(require_user)) -> Pb1ReportStateOut:
+    try:
+        return set_final_done(year, row, True, username)
+    except Pb1EditError as exc:
+        raise HTTPException(exc.status_code, str(exc)) from None
+
+
+@router.post("/pb1-report/final-unlock")
+def post_final_unlock(year: int, row: int, username: str = Depends(require_user)) -> Pb1ReportStateOut:
+    try:
+        return set_final_done(year, row, False, username)
+    except Pb1EditError as exc:
+        raise HTTPException(exc.status_code, str(exc)) from None
+
+
+def set_submitted(year: int, row: int, submitted: bool, user: str) -> Pb1ReportStateOut:
+    """Marks the company's PB-1 report as submitted now (only a final report marked as done; Home
+    "PB-1, PB-2 Predat" = 1; unlocking is not possible while submitted) or withdraws the
+    submission (Home "PB-1, PB-2 Predat" = 0). Raises Pb1EditError."""
+    form = load_pb1_form(year, row, DEFAULT_TAB, user, report=FINAL)
+    if submitted and not form.state.final_done:
+        raise Pb1EditError(status.HTTP_409_CONFLICT, "Predaje se samo konačni izveštaj označen kao gotov.")
+    if (form.state.submitted_at is not None) != submitted:
+        try:
+            form.store.set_submitted(year, form.company_key, submitted, user)
+        except Pb1StoreError as exc:
+            raise Pb1EditError(status.HTTP_409_CONFLICT, str(exc)) from None
+        logger.info(
+            "PB-1 report of '%s' (row %d, %s) %s by '%s'", form.company.name, row, year,
+            "submitted" if submitted else "submission withdrawn", user,
+        )
+        _set_home_status(year, row, SUBMITTED_FIELD, 1 if submitted else 0, user)
+    return _state_out(form.store.report_state(year, form.company_key))
+
+
+def report_history(year: int, row: int, user: str) -> list[Pb1ReportEventOut]:
+    """The steps of the company's PB-1 reports with date, time and user, newest first."""
+    form = load_pb1_form(year, row, DEFAULT_TAB, user, report=PRELIMINARY)
+    events = form.store.report_history(year, form.company_key)
+    return [Pb1ReportEventOut(event=e.event, at=e.at, by=e.by) for e in reversed(events)]
+
+
+@router.post("/pb1-report/submitted")
+def post_submitted(year: int, row: int, username: str = Depends(require_user)) -> Pb1ReportStateOut:
+    try:
+        return set_submitted(year, row, True, username)
+    except Pb1EditError as exc:
+        raise HTTPException(exc.status_code, str(exc)) from None
+
+
+@router.post("/pb1-report/submission-withdrawn")
+def post_submission_withdrawn(year: int, row: int, username: str = Depends(require_user)) -> Pb1ReportStateOut:
+    try:
+        return set_submitted(year, row, False, username)
+    except Pb1EditError as exc:
+        raise HTTPException(exc.status_code, str(exc)) from None
+
+
+@router.get("/pb1-report/history")
+def get_report_history(year: int, row: int, username: str = Depends(require_user)) -> list[Pb1ReportEventOut]:
+    try:
+        return report_history(year, row, username)
+    except Pb1EditError as exc:
+        raise HTTPException(exc.status_code, str(exc)) from None
+
+
+@router.post("/pb1-report/gfi-done")
+def post_gfi_done(year: int, row: int, username: str = Depends(require_user)) -> Pb1ReportStateOut:
+    try:
+        return set_gfi_done(year, row, True, username)
+    except Pb1EditError as exc:
+        raise HTTPException(exc.status_code, str(exc)) from None
+
+
+@router.post("/pb1-report/gfi-reopen")
+def post_gfi_reopen(year: int, row: int, username: str = Depends(require_user)) -> Pb1ReportStateOut:
+    try:
+        return set_gfi_done(year, row, False, username)
+    except Pb1EditError as exc:
+        raise HTTPException(exc.status_code, str(exc)) from None
+

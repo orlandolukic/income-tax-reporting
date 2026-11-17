@@ -4,7 +4,8 @@ import ProtectedRoute from "./auth/ProtectedRoute";
 import { AuthenticatedLayout } from "./components/layout/AuthenticatedLayout";
 import { TooltipProvider } from "./components/ui/tooltip";
 import { ThemeProvider } from "./context/ThemeProvider";
-import CompanyRegistryPage from "./pages/CompanyRegistryPage";
+import EditCompanyDataPage from "./pages/EditCompanyDataPage";
+import GlobalSettingsPage from "./pages/GlobalSettingsPage";
 import HomePage from "./pages/HomePage";
 import LoginPage from "./pages/LoginPage";
 import MigrationPage from "./pages/MigrationPage";
@@ -26,8 +27,11 @@ export default function App() {
                 }
               >
                 <Route path="/" element={<HomePage />} />
-                <Route path="/company-registry" element={<CompanyRegistryPage />} />
+                <Route path="/edit-company-data" element={<EditCompanyDataPage />} />
+                {/* The page's former address. */}
+                <Route path="/company-registry" element={<Navigate to="/edit-company-data" replace />} />
                 <Route path="/migration" element={<MigrationPage />} />
+                <Route path="/global-settings" element={<GlobalSettingsPage />} />
                 <Route path="/companies/:year/:row/pb1" element={<Pb1Page />} />
                 <Route path="/companies/:year/:row/pb1/:tab" element={<Pb1Page />} />
               </Route>

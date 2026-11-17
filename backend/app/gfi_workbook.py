@@ -1,54 +1,52 @@
-"""Reading the company table from a GFI workbook.
+"""Reading a GFI workbook ("<year> GFI *.xlsx"). Used only by the one-time import
+(app.gfi_import); the app itself never opens a workbook (everything is in PostgreSQL).
 
 The table is on the first sheet: row 1 holds the headers, the following rows hold one
 company each. Only columns A..N are used. Headers and values are returned exactly as
 stored (formula cells give their last calculated value, as Excel displays them).
-
-The workbook is never written. User edits live in SQLite (app.edits_store) and are
-applied on top of the Excel values by the API.
+The workbook is never written.
 """
 
 import datetime
-from dataclasses import dataclass, field
+import os
+import re
 from pathlib import Path
 
 from openpyxl import load_workbook
 from openpyxl.utils import get_column_letter
 
+from app.gfi_table import CellValue, SourceCell, SourceTable
+from app.logging_config import get_logger
+
+logger = get_logger(__name__)
+
+# The folder with the Excel files (GFI_DATA_DIR, default: the project root).
+DEFAULT_DATA_DIR = Path(__file__).resolve().parents[2]
+GFI_FILE_PATTERN = re.compile(r"^(\d{4}) GFI .*\.xlsx$", re.IGNORECASE)
+
+
+def get_data_dir() -> Path:
+    return Path(os.getenv("GFI_DATA_DIR", DEFAULT_DATA_DIR))
+
+
+def find_workbooks(data_dir: Path) -> dict[int, list[Path]]:
+    """Map each reporting year to its GFI workbook files (sorted by name)."""
+    if not data_dir.is_dir():
+        logger.error("GFI data directory not found: %s", data_dir)
+        return {}
+    workbooks: dict[int, list[Path]] = {}
+    for path in sorted(data_dir.iterdir()):
+        # Skip Excel's temporary lock files ("~$...") created while a workbook is open.
+        if path.name.startswith("~$"):
+            continue
+        match = GFI_FILE_PATTERN.match(path.name)
+        if match and path.is_file():
+            workbooks.setdefault(int(match.group(1)), []).append(path)
+    return workbooks
+
 FIRST_COLUMN = 1  # A
 LAST_COLUMN = 14  # N
 COLUMN_KEYS = [get_column_letter(i) for i in range(FIRST_COLUMN, LAST_COLUMN + 1)]
-
-CellValue = str | int | float | bool | None
-
-
-@dataclass(frozen=True)
-class SourceCell:
-    value: CellValue  # stored value (cached result for formulas)
-    number_format: str  # Excel number format, e.g. "#,##0_);[Red](#,##0)"
-    is_formula: bool
-    locked: bool = False  # not editable as a number regardless of content (e.g. company details in the database)
-
-    @property
-    def is_editable(self) -> bool:
-        """Only plain numeric cells can be edited; formulas, text and empty cells cannot."""
-        return (
-            not self.locked
-            and not self.is_formula
-            and isinstance(self.value, (int, float))
-            and not isinstance(self.value, bool)
-        )
-
-
-@dataclass(frozen=True)
-class SourceTable:
-    workbook: str
-    sheet: str
-    headers: dict[str, str | None]  # column letter -> original header
-    rows: dict[int, dict[str, SourceCell]]  # Excel row number -> column letter -> cell
-    # Column letter -> GFI field (name, pib, kom, ...), found by header; set by app.gfi_store.
-    fields: dict[str, str] = field(default_factory=dict)
-
 
 def _to_json_value(value: object) -> CellValue:
     if isinstance(value, (datetime.datetime, datetime.date, datetime.time)):
@@ -118,13 +116,21 @@ def main_list_rows(table: SourceTable) -> list[int]:
     return rows
 
 
+# The workbook's "kom" column is not kept: kom is 1 for every company (app.models.KOM).
+KOM_HEADER = "KOM"
+
+
+def _is_kom(header: str | None) -> bool:
+    return header is not None and header.strip().upper() == KOM_HEADER
+
+
 def company_list(table: SourceTable) -> SourceTable:
     """The company list as the app uses it: only the main_list_rows (all rows if the
-    workbook has no R.B. sequence), without the R.B. columns. R.B. is used only here, to
-    find the list; it is not shown, returned by the API or stored. The app numbers the
-    companies itself ("#" = position in the list)."""
+    workbook has no R.B. sequence), without the R.B. columns and without "kom". R.B. is used
+    only here, to find the list; it is not shown, returned by the API or stored. The app numbers
+    the companies itself ("#" = position in the list)."""
     rows = main_list_rows(table) or list(table.rows)
-    keep = [key for key, header in table.headers.items() if not _is_rb(header)]
+    keep = [key for key, header in table.headers.items() if not _is_rb(header) and not _is_kom(header)]
     return SourceTable(
         workbook=table.workbook,
         sheet=table.sheet,
@@ -132,17 +138,3 @@ def company_list(table: SourceTable) -> SourceTable:
         rows={row: {key: table.rows[row][key] for key in keep} for row in rows},
         fields=table.fields,
     )
-
-
-_cache: dict[Path, tuple[float, SourceTable]] = {}
-
-
-def load_source_table(path: Path) -> SourceTable:
-    """read_source_table with a cache that is invalidated when the file changes."""
-    mtime = path.stat().st_mtime
-    cached = _cache.get(path)
-    if cached and cached[0] == mtime:
-        return cached[1]
-    table = read_source_table(path)
-    _cache[path] = (mtime, table)
-    return table

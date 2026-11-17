@@ -12,17 +12,14 @@ Steps (all in one transaction; any problem rolls everything back):
 2. If the year was imported before, stop, unless --replace is given. --replace removes the
    earlier import only if none of its values were changed in the database (no edit can
    be lost); its change_log history is kept.
-3. First import of a year: read the user edits for that workbook from SQLite (read-only).
-   Every edit must belong to an editable numeric GFI cell in the kept rows; otherwise the
-   import stops, so no edit is ever dropped. A --replace does not apply them again: they
-   were carried over by the first import and the database is the source of truth since.
-4. Write the snapshot (source_file, gfi_column, source_cell), companies, company years,
-   referents, offices and import issues, then apply the SQLite edits (with change_log
-   entries). Companies, referents and offices no longer used are removed.
-5. Verify: build the GFI table from the database and compare every cell with the table
-   built from Excel + SQLite (value, format, formula, editable, edited, original).
+3. Write the snapshot (source_file, gfi_column, source_cell), companies, company years,
+   referents, offices and import issues. Companies, referents and offices no longer used
+   are removed.
+4. Verify: build the GFI table from the database and compare every cell with the table
+   built from the workbook (value, format, formula, editable, edited, original).
 
-The Excel file and the SQLite database are never written.
+The Excel file is never written. (The 2025 import of 2026-11-12 also carried over the edits
+saved before PostgreSQL in the old SQLite store, deleted on 2026-11-13.)
 """
 
 import argparse
@@ -31,7 +28,6 @@ import dataclasses
 import getpass
 import hashlib
 import re
-import sqlite3
 import sys
 from datetime import datetime, timezone
 from pathlib import Path
@@ -40,40 +36,34 @@ from app.settings import load_settings
 
 load_settings()
 
-from sqlalchemy import delete, select  # noqa: E402
+from sqlalchemy import delete, func, select  # noqa: E402
 from sqlalchemy.orm import Session  # noqa: E402
 
 from app.companies import CompanyTable, build_company_table  # noqa: E402
 from app.db import database_enabled, describe_database, session_scope  # noqa: E402
-from app.edits_store import get_database_path  # noqa: E402
 from app.gfi_store import (  # noqa: E402
     OFFICE_FIELD,
-    TEXT_FIELDS,
-    Edits,
-    current_text,
-    edit_kind,
     load_table,
     map_columns,
-    set_text,
     to_decimal,
 )
-from app.gfi_workbook import SourceTable, company_list, main_list_rows, read_source_table  # noqa: E402
+from app.gfi_table import SourceTable  # noqa: E402
+from app.gfi_workbook import company_list, find_workbooks, get_data_dir, main_list_rows, read_source_table  # noqa: E402
 from app.logging_config import get_logger, setup_logging  # noqa: E402
 from app.models import (  # noqa: E402
     NUMERIC_FIELDS,
-    ChangeLog,
     Company,
     CompanyYear,
     GfiColumn,
     ImportIssue,
     Office,
-    Pb1Link,
+    Pb1CompanyEdit,
+    Pb1ReportState,
     Referent,
     ReportingYear,
     SourceCell,
     SourceFile,
 )
-from app.reporting_years import find_workbooks, get_data_dir  # noqa: E402
 
 logger = get_logger("gfi_import")
 
@@ -97,49 +87,6 @@ def _workbook_path(year: int) -> Path:
     return paths[0]
 
 
-def _read_sqlite_edits(source: SourceTable) -> list[tuple]:
-    """(row, col, value, original_value, updated_by, updated_at) for this workbook, read-only.
-    Text edits (company details) are returned as text values."""
-    path = get_database_path()
-    if not path.exists():
-        return []
-    conn = sqlite3.connect(f"file:{path}?mode=ro", uri=True)
-    try:
-        columns = {row[1] for row in conn.execute("PRAGMA table_info(cell_edits)")}
-        text = "value_text" in columns
-        rows = conn.execute(
-            "SELECT row, col, value, original_value, updated_by, updated_at"
-            + (", value_text, original_text" if text else ", NULL, NULL")
-            + " FROM cell_edits WHERE workbook = ? AND sheet = ? ORDER BY row, col",
-            (source.workbook, source.sheet),
-        ).fetchall()
-    finally:
-        conn.close()
-    return [
-        (row, col, value_text if value_text is not None else value,
-         original_text if original_text is not None else original, user, at)
-        for row, col, value, original, user, at, value_text, original_text in rows
-    ]
-
-
-def _read_sqlite_pb1_links(year: int, gfi_workbook: str) -> list[tuple]:
-    """(pb1_workbook, pb1_company, gfi_row, linked_by, linked_at) for links to this GFI workbook, read-only."""
-    path = get_database_path()
-    if not path.exists():
-        return []
-    conn = sqlite3.connect(f"file:{path}?mode=ro", uri=True)
-    try:
-        if not conn.execute("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'pb1_links'").fetchone():
-            return []
-        return conn.execute(
-            "SELECT pb1_workbook, pb1_company, gfi_row, linked_by, linked_at FROM pb1_links"
-            " WHERE year = ? AND gfi_workbook = ?",
-            (year, gfi_workbook),
-        ).fetchall()
-    finally:
-        conn.close()
-
-
 def _remove_previous_import(session: Session, year: int, replace: bool) -> bool:
     """Remove an earlier import of the year (see the module docstring). True if one was removed."""
     previous = session.scalar(select(SourceFile).where(SourceFile.kind == "gfi", SourceFile.year == year))
@@ -150,12 +97,31 @@ def _remove_previous_import(session: Session, year: int, replace: bool) -> bool:
             f"{year} was already imported from {previous.file_name} on {previous.imported_at:%Y-%m-%d %H:%M}."
             " Use --replace to import it again."
         )
-    _, edits = load_table(session, year)
+    source, edits = load_table(session, year)
+    # The status columns follow the PB-1 report steps, not the workbook: not a lost value here
+    # (the steps themselves are checked below).
+    edits = {k: v for k, v in edits.items() if source.fields.get(k[1]) not in NUMERIC_FIELDS}
     if edits:
         listed = ", ".join(f"{col}{row}" for row, col in sorted(edits))
         raise ImportStopped(
             f"The earlier {year} import has {len(edits)} value(s) changed in the database ({listed})."
             " Replacing it would lose them, so nothing was changed."
+        )
+    pb1_values = session.scalar(
+        select(func.count()).select_from(Pb1CompanyEdit).join(CompanyYear).where(CompanyYear.year == year)
+    )
+    steps = session.scalar(
+        select(func.count()).select_from(Pb1ReportState).join(CompanyYear).where(CompanyYear.year == year)
+    )
+    if steps:
+        raise ImportStopped(
+            f"{steps} {year} companies have PB-1 report steps stored."
+            " Replacing the GFI import would lose them, so nothing was changed."
+        )
+    if pb1_values:
+        raise ImportStopped(
+            f"{pb1_values} PB-1 value(s) of {year} companies are stored in the database."
+            " Replacing the GFI import would lose them, so nothing was changed."
         )
     logger.info("Removing the earlier %s import (%s, no changed values)", year, previous.file_name)
     session.delete(previous)  # cascades to gfi_column, source_cell, company_year, import_issue
@@ -200,7 +166,7 @@ def _cell_columns(value: object) -> dict:
 def _verify(
     session: Session, year: int, expected: CompanyTable, kept: list[int], field_of: dict[str, str]
 ) -> collections.Counter:
-    """Compare the table built from the database with the Excel + SQLite table."""
+    """Compare the table built from the database with the table built from the workbook."""
     db_source, db_edits = load_table(session, year)
     actual = build_company_table(db_source, db_edits)
     known = collections.Counter()
@@ -229,13 +195,53 @@ def _verify(
                 known["numeric PIB stored as text"] += 1
                 want["value"] = got["value"]
             if got != want:
-                problems.append(f"{col}{row}: Excel+SQLite {want} != database {got}")
+                problems.append(f"{col}{row}: Excel {want} != database {got}")
 
     if problems:
         shown = "\n  ".join(problems[:20])
         more = f"\n  ... and {len(problems) - 20} more" if len(problems) > 20 else ""
         raise ImportStopped(f"Verification failed, {len(problems)} difference(s):\n  {shown}{more}")
     return known
+
+
+def _statuses_not_empty(source: SourceTable, field_of: dict[str, str]) -> SourceTable:
+    """Status columns are never empty (user's rule): an empty or blank cell of the workbook is
+    imported as 0 (snapshot and current value). Any other value than 0 / 1 stops the import."""
+    status_cols = [col for col, field in field_of.items() if field in NUMERIC_FIELDS]
+    wrong = []
+    rows = {}
+    for row, cells in source.rows.items():
+        cells = dict(cells)
+        for col in status_cols:
+            cell = cells[col]
+            value = cell.value
+            if value is None or (isinstance(value, str) and not value.strip()):
+                cells[col] = dataclasses.replace(cell, value=0)
+            elif isinstance(value, bool) or value not in (0, 1):
+                wrong.append(f"{col}{row}={value!r}")
+        rows[row] = cells
+    if wrong:
+        raise ImportStopped(f"Status cells must be 0 or 1 (or empty): {', '.join(wrong[:20])}")
+    return dataclasses.replace(source, rows=rows)
+
+
+def _details_upper_case(source: SourceTable, field_of: dict[str, str]) -> SourceTable:
+    """NAZIV, REFERENT and office are stored in upper case (user's rule, 2026-11-14), snapshot and
+    current value alike; a REFERENT / office written as "-" is empty ("-" is how the app shows an
+    empty detail)."""
+    cols = {col: field for col, field in field_of.items() if field in ("name", "referent", OFFICE_FIELD)}
+    rows = {}
+    for row, cells in source.rows.items():
+        cells = dict(cells)
+        for col, field in cols.items():
+            value = cells[col].value
+            if not isinstance(value, str):
+                continue
+            new = None if field != "name" and value.strip() == "-" else value.upper()
+            if new != value:
+                cells[col] = dataclasses.replace(cells[col], value=new)
+        rows[row] = cells
+    return dataclasses.replace(source, rows=rows)
 
 
 def import_year(year: int, replace: bool, dry_run: bool, user: str) -> None:
@@ -252,40 +258,17 @@ def import_year(year: int, replace: bool, dry_run: bool, user: str) -> None:
     except ValueError as exc:
         raise ImportStopped(str(exc)) from exc
     source = dataclasses.replace(source, fields=field_of)
+    source = _statuses_not_empty(source, field_of)
+    source = _details_upper_case(source, field_of)
     col_of = {field: col for col, field in field_of.items()}
     last = source.rows[kept[-1]][col_of["name"]].value
     logger.info("%s: %d companies (Excel rows %d-%d), last: #%d %s", path.name, len(kept), kept[0], kept[-1], len(kept), last)
 
     now = datetime.now(timezone.utc)
     with session_scope() as session:
-        replaced = _remove_previous_import(session, year, replace)
+        _remove_previous_import(session, year, replace)
 
-        # SQLite edits: carried over by the first import of a year, every one of them. After
-        # that the database is the source of truth, so a --replace does not apply them again.
-        if replaced:
-            sqlite_edits = []
-            logger.info("Earlier import replaced: SQLite edits are not applied again (already carried over)")
-        else:
-            sqlite_edits = _read_sqlite_edits(source)
-        excel_edits: Edits = {}
-        unmappable = []
-        for row, col, value, original, *_ in sqlite_edits:
-            cell = source.rows.get(row, {}).get(col)
-            kind = edit_kind(source, col, cell) if cell is not None else None
-            wrong_type = (kind == "number" and isinstance(value, str)) or (
-                kind == "text" and value is not None and not isinstance(value, str)
-            )
-            if row not in kept or kind is None or wrong_type:
-                unmappable.append(f"{col}{row}")
-            excel_edits[(row, col)] = (value, original)
-        if unmappable:
-            raise ImportStopped(
-                f"{len(unmappable)} saved edit(s) are outside the imported company list or not in an editable"
-                f" GFI column ({', '.join(unmappable)}). They would be lost, so nothing was imported."
-            )
-        if not replaced:
-            logger.info("Saved edits in SQLite for %s: %d (all will be carried over)", path.name, len(sqlite_edits))
-        expected = build_company_table(source, excel_edits)
+        expected = build_company_table(source, {})
 
         if session.get(ReportingYear, year) is None:
             session.add(ReportingYear(year=year))
@@ -334,13 +317,9 @@ def import_year(year: int, replace: bool, dry_run: bool, user: str) -> None:
             company = Company(name=str(name), pib=pib, created_at=now)
             session.add(company)
 
-            values = {}
-            for field in NUMERIC_FIELDS:
-                value = cells[col_of[field]].value
-                if isinstance(value, (int, float)) and not isinstance(value, bool):
-                    values[field] = to_decimal(value)
-                elif value is not None:
-                    issue(row, col_of[field], f"Not a number: {value!r} (kept in the snapshot only)")
+            # The status columns are set only by the PB-1 report steps (user, 2026-11-17): a
+            # company without steps has 0 everywhere; the workbook's values stay in the snapshot.
+            values = {field: to_decimal(0) for field in NUMERIC_FIELDS}
             referent_id = office_id = None
             for field, model, cache in (("referent", Referent, referents), (OFFICE_FIELD, Office, offices)):
                 value = cells[col_of[field]].value
@@ -365,51 +344,18 @@ def import_year(year: int, replace: bool, dry_run: bool, user: str) -> None:
         session.add_all(issues)
         session.flush()
 
-        for row, col, value, original, updated_by, updated_at in sqlite_edits:
-            company_year, field = company_years[row], field_of[col]
-            excel_value = source.rows[row][col].value
-            if original != excel_value:
-                logger.warning("Edit %s%d was made when the Excel value was %r (now %r); keeping the edit", col, row, original, excel_value)
-            changed_at = datetime.fromisoformat(updated_at)
-            log = ChangeLog(
-                company_year_id=company_year.id, year=year, source_row=row, col=col, field=field,
-                changed_by=updated_by, changed_at=changed_at,
-            )
-            if field in TEXT_FIELDS:
-                log.old_text, log.new_text = current_text(company_year, field), value
-                set_text(session, company_year, field, value)
-            else:
-                log.old_value, log.new_value = getattr(company_year, field), to_decimal(value)
-                setattr(company_year, field, log.new_value)
-            session.add(log)
-            company_year.updated_at, company_year.updated_by = changed_at, updated_by
-        session.flush()
-
-        # PB-1 links (which company a PB-1 file belongs to) carried over by company identity.
-        # A link to a row outside the company list is not carried (it is made again when needed).
-        for pb1_workbook, pb1_company, gfi_row, linked_by, linked_at in _read_sqlite_pb1_links(year, source.workbook):
-            if gfi_row in company_years:
-                session.merge(Pb1Link(
-                    year=year, pb1_file_name=pb1_workbook, pb1_company=pb1_company,
-                    company_year_id=company_years[gfi_row].id, linked_by=linked_by,
-                    linked_at=datetime.fromisoformat(linked_at),
-                ))
-                logger.info("PB-1 link carried over: %s -> row %d", pb1_workbook, gfi_row)
-            else:
-                logger.warning("PB-1 link of %s points outside the company list (row %d); not carried over", pb1_workbook, gfi_row)
-        session.flush()
         _remove_unused(session)
 
         known = _verify(session, year, expected, kept, field_of)
-        logger.info("Verification passed: all %d rows x %d columns match Excel + SQLite", len(kept), len(source.headers))
+        logger.info("Verification passed: all %d rows x %d columns match the workbook", len(kept), len(source.headers))
         for reason, count in known.items():
             logger.info("  intended difference: %s (%d cells)", reason, count)
         logger.info("Import issues: %d", len(issues))
         for item in issues:
             logger.info("  row %s %s: %s", item.row, item.col or "", item.message)
         logger.info(
-            "Imported: %d companies, %d referents, %d offices, %d cells, %d edits",
-            len(kept), len(referents), len(offices), len(kept) * len(source.headers), len(sqlite_edits),
+            "Imported: %d companies, %d referents, %d offices, %d cells",
+            len(kept), len(referents), len(offices), len(kept) * len(source.headers),
         )
         if dry_run:
             raise DryRunDone

@@ -4,7 +4,13 @@ import { Main } from "@/components/layout/Main";
 export default function HomePage() {
   return (
     <Main>
-      <GfiTableView title="Home" variant="home" />
+      {/* View only (user, 2026-11-17): the statuses follow the PB-1 report steps, the company
+          details are edited on Edit Company Data. */}
+      <GfiTableView
+        title="Home"
+        variant="home"
+        description="Pregled svih firmi, samo za gledanje. Statusi se postavljaju koracima u PB-1 (preliminarni gotov, GFI gotov, konačni gotov, predat), a podaci firme se menjaju na Edit Company Data."
+      />
     </Main>
   );
 }

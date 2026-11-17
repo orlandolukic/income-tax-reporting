@@ -9,8 +9,13 @@ const logger = getLogger("autosave");
 const STORAGE_KEY = "pending-cell-edits";
 const RETRY_DELAY_MS = 10_000;
 
-/** A PB-1 form field: amount of one company, or a template field shared by every company. */
-export type Pb1Target = { company: number; tab: string; shared: boolean };
+/** One of a company's two PB-1 reports (user, 2026-11-17). */
+export type Pb1Report = "preliminary" | "final";
+/**
+ * A PB-1 form field: amount of one company in one of its reports, or a template field shared by
+ * every company. A change queued before the reports existed has no `report`: the preliminary one.
+ */
+export type Pb1Target = { company: number; tab: string; shared: boolean; report?: Pb1Report };
 /** A GFI cell edit, or (with `pb1`) a PB-1 field edit; `row` is the Excel row. */
 export type PendingEdit = PendingValue & { year: number; pb1?: Pb1Target };
 export type SaveResult = {
@@ -20,12 +25,17 @@ export type SaveResult = {
   edited: boolean;
   /** Recomputed formula columns of the same row (GFI ZA RAD, PB-1,PB-2 za rad). */
   formulas?: Record<string, number | string | null>;
-  /** Recomputed table statistics (totals under the Home table). */
+  /** Recomputed table statistics (totals above the Home table). */
   stats?: TableStats;
   /** PB-1: the tab's computed cells (workbook formulas) after the change. */
   computed?: { row: number; column: string; value: number | null }[];
   /** PB-1: tax loss after the change (the Poreski bilans tax base is negative). */
   loss?: { base: number } | null;
+  /** PB-1: accounting and tax result after the change. */
+  results?: {
+    accounting: { value: number; status: "profit" | "loss" | "zero" };
+    tax: { value: number; status: "profit" | "loss" | "zero" };
+  } | null;
 };
 export type SaveState =
   | { state: "idle" }
@@ -42,12 +52,12 @@ type Callbacks = {
 
 const keyOf = (e: PendingEdit) =>
   e.pb1
-    ? `${e.year}:pb1:${e.pb1.tab}:${e.pb1.shared ? "all" : e.pb1.company}:${e.column}${e.row}`
+    ? `${e.year}:pb1:${e.pb1.tab}:${e.pb1.shared ? "all" : `${e.pb1.company}:${e.pb1.report ?? "preliminary"}`}:${e.column}${e.row}`
     : `${e.year}:${e.column}${e.row}`;
 
 const urlOf = (e: PendingEdit) =>
   e.pb1
-    ? `/api/reporting-years/${e.year}/companies/${e.pb1.company}/pb1/${e.pb1.tab}/cells/${e.column}/${e.row}`
+    ? `/api/reporting-years/${e.year}/companies/${e.pb1.company}/pb1/${e.pb1.tab}/cells/${e.column}/${e.row}?report=${e.pb1.report ?? "preliminary"}`
     : `/api/reporting-years/${e.year}/cells/${e.column}/${e.row}`;
 
 function loadQueue(): PendingEdit[] {
@@ -111,13 +121,13 @@ export function useCellAutosave(callbacks: Callbacks) {
           });
         } catch (err) {
           logger.error("Save failed: network error", err);
-          scheduleRetry("Can't reach the server.");
+          scheduleRetry("Server nije dostupan.");
           return;
         }
 
         if (res.status === 401) {
           logger.warning("Save paused: session expired; changes kept locally");
-          setStatus({ state: "error", message: "Session expired.", retrying: false });
+          setStatus({ state: "error", message: "Sesija je istekla.", retrying: false });
           callbacksRef.current.onUnauthorized();
           return;
         }
@@ -125,12 +135,12 @@ export function useCellAutosave(callbacks: Callbacks) {
           logger.error(`Save rejected (HTTP ${res.status}) for ${keyOf(edit)}`);
           updateQueue(queueRef.current.slice(1));
           callbacksRef.current.onRejected(edit);
-          setStatus({ state: "error", message: "A change was rejected and has been reverted.", retrying: false });
+          setStatus({ state: "error", message: "Izmena je odbijena i vraćena na prethodnu vrednost.", retrying: false });
           continue;
         }
         if (!res.ok) {
           logger.error(`Save failed: HTTP ${res.status}`);
-          scheduleRetry("Saving failed.");
+          scheduleRetry("Čuvanje nije uspelo.");
           return;
         }
 
@@ -184,11 +194,15 @@ export function useCellAutosave(callbacks: Callbacks) {
     [],
   );
 
-  // PB-1 edits shown on one company's form tab: its amounts and the shared template fields.
+  // PB-1 edits shown on one company's form tab in one report: its amounts and the shared
+  // template fields.
   const pendingPb1 = useCallback(
-    (year: number, company: number, tab: string) =>
+    (year: number, company: number, tab: string, report: Pb1Report) =>
       queueRef.current.filter(
-        (e) => e.year === year && e.pb1?.tab === tab && (e.pb1.shared || e.pb1.company === company),
+        (e) =>
+          e.year === year &&
+          e.pb1?.tab === tab &&
+          (e.pb1.shared || (e.pb1.company === company && (e.pb1.report ?? "preliminary") === report)),
       ),
     [],
   );

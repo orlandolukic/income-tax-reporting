@@ -1,8 +1,8 @@
 """PostgreSQL connection (SQLAlchemy 2 + psycopg 3).
 
-The database is used when DATABASE_URL is set, e.g.
+All data of the app is in this database; DATABASE_URL (backend/.env) is required, e.g.
     DATABASE_URL=postgresql://income_tax:<password>@localhost:5432/income_tax_reporting
-Without it the app keeps reading GFI data from the Excel workbooks (edits in SQLite).
+The backend doesn't start without it.
 """
 
 import os
@@ -10,7 +10,7 @@ from collections.abc import Iterator
 from contextlib import contextmanager
 from functools import cache
 
-from sqlalchemy import Engine, create_engine, event
+from sqlalchemy import Engine, create_engine
 from sqlalchemy.orm import Session
 
 
@@ -34,12 +34,9 @@ def _sqlalchemy_url(url: str) -> str:
 @cache
 def _engine(url: str) -> Engine:
     engine = create_engine(_sqlalchemy_url(url), pool_pre_ping=True)
-    if engine.dialect.name == "sqlite":
-        # SQLite is only used for local tests; enforce foreign keys (ON DELETE CASCADE) like PostgreSQL.
-        @event.listens_for(engine, "connect")
-        def _enable_foreign_keys(dbapi_connection, _record) -> None:
-            dbapi_connection.execute("PRAGMA foreign_keys = ON")
-
+    if engine.dialect.name != "postgresql":
+        # PostgreSQL is the only store of the app's data (no SQLite or other database).
+        raise RuntimeError(f"DATABASE_URL must be a PostgreSQL database, not {engine.dialect.name}")
     return engine
 
 

@@ -1,4 +1,4 @@
-import { Workflow } from "lucide-react";
+import { AppLogo } from "@/components/AppLogo";
 import { Link, useLocation } from "react-router";
 import {
   Sidebar,
@@ -12,8 +12,21 @@ import {
   SidebarMenuItem,
   SidebarRail,
 } from "@/components/ui/sidebar";
-import { navGroups } from "@/config/navigation";
+import { footerNavItems, navGroups, type NavItem } from "@/config/navigation";
 import { NavUser } from "./NavUser";
+
+function NavLink({ item, active }: { item: NavItem; active: boolean }) {
+  return (
+    <SidebarMenuItem>
+      <SidebarMenuButton asChild isActive={active} tooltip={item.title}>
+        <Link to={item.url}>
+          <item.icon />
+          <span>{item.title}</span>
+        </Link>
+      </SidebarMenuButton>
+    </SidebarMenuItem>
+  );
+}
 
 export function AppSidebar() {
   const { pathname } = useLocation();
@@ -25,9 +38,7 @@ export function AppSidebar() {
           <SidebarMenuItem>
             <SidebarMenuButton size="lg" asChild>
               <Link to="/">
-                <div className="bg-sidebar-primary text-sidebar-primary-foreground flex aspect-square size-8 items-center justify-center rounded-lg">
-                  <Workflow className="size-4" />
-                </div>
+                <AppLogo />
                 <div className="grid flex-1 text-start text-sm leading-tight">
                   <span className="truncate font-semibold">Income Tax Reporting</span>
                   <span className="truncate text-xs">Admin</span>
@@ -43,20 +54,18 @@ export function AppSidebar() {
             <SidebarGroupLabel>{group.title}</SidebarGroupLabel>
             <SidebarMenu>
               {group.items.map((item) => (
-                <SidebarMenuItem key={item.url}>
-                  <SidebarMenuButton asChild isActive={pathname === item.url} tooltip={item.title}>
-                    <Link to={item.url}>
-                      <item.icon />
-                      <span>{item.title}</span>
-                    </Link>
-                  </SidebarMenuButton>
-                </SidebarMenuItem>
+                <NavLink key={item.url} item={item} active={pathname === item.url} />
               ))}
             </SidebarMenu>
           </SidebarGroup>
         ))}
       </SidebarContent>
       <SidebarFooter>
+        <SidebarMenu>
+          {footerNavItems.map((item) => (
+            <NavLink key={item.url} item={item} active={pathname === item.url} />
+          ))}
+        </SidebarMenu>
         <NavUser />
       </SidebarFooter>
       <SidebarRail />

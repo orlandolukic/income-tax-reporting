@@ -57,7 +57,7 @@ export function ReportingYearProvider({ children }: { children: ReactNode }) {
       })
       .catch((err) => {
         logger.error("Failed to load reporting years", err);
-        setError("Unable to load reporting years.");
+        setError("Godine nisu mogle da se učitaju.");
       })
       .finally(() => setLoading(false));
   }, [reloadKey]);

@@ -68,7 +68,7 @@ export function CompanySelectDialog({
           onUnauthorized();
           throw new Error("Sesija je istekla.");
         }
-        if (!res.ok) throw new Error((await res.json().catch(() => null))?.detail ?? `HTTP ${res.status}`);
+        if (!res.ok) throw new Error((await res.json().catch(() => null))?.detail ?? `Greška na serveru (HTTP ${res.status}).`);
         return res.json();
       })
       .then((list: RegistryCompany[]) => {
@@ -135,20 +135,20 @@ export function CompanySelectDialog({
           <Input
             value={query}
             onChange={(e) => setQuery(e.target.value)}
-            placeholder="Pretraga: naziv, PIB, referent, kancelarija"
+            placeholder="Search: name, PIB, referent, office"
             className="min-w-48 flex-1"
-            aria-label="Pretraga firmi"
+            aria-label="Search companies"
           />
           <Button variant="outline" size="sm" onClick={() => setAll(true)} disabled={!companies}>
-            Izaberi sve
+            Select all
           </Button>
           <Button variant="outline" size="sm" onClick={() => setAll(false)} disabled={!companies}>
-            Poništi sve
+            Clear all
           </Button>
         </div>
         <p className="text-muted-foreground text-sm">
-          {companies ? `Izabrano ${selected.size} od ${companies.length}` : "Učitavanje registra…"}
-          {companies && query.trim() !== "" && ` · prikazano ${shown.length}`}
+          {companies ? `Selected ${selected.size} of ${companies.length}` : "Učitavanje registra…"}
+          {companies && query.trim() !== "" && ` · shown ${shown.length}`}
         </p>
 
         <div className="max-h-[50vh] overflow-auto rounded-md border">
@@ -190,7 +190,7 @@ export function CompanySelectDialog({
 
         <DialogFooter>
           <Button variant="outline" onClick={() => onOpenChange(false)} disabled={saving}>
-            Otkaži
+            Cancel
           </Button>
           <Button onClick={() => void confirm()} disabled={saving || !companies || selected.size === 0}>
             {saving && <Loader2 className="animate-spin" />}

@@ -6,11 +6,11 @@ const TOTAL_FORMAT = "#,##0.##";
 const SHARE_FORMAT = "0.0%";
 
 /**
- * Statistics under the Home table: the totals of Preliminarni, GFI uradjen and GFI ZA RAD
- * over all companies, each with its share of the kom total. Computed by the server.
+ * Statistics above the Home table: the totals of Preliminarni, GFI uradjen and GFI ZA RAD
+ * over all companies, each with its share of the kom total, i.e. of the number of companies
+ * (kom = 1 for every company). Computed by the server.
  */
 export function GfiStats({ stats }: { stats: TableStats }) {
-  const base = stats.base_header?.trim() || stats.base_key;
   const baseTotal = formatNumber(stats.base_total, TOTAL_FORMAT).text;
 
   return (
@@ -25,8 +25,8 @@ export function GfiStats({ stats }: { stats: TableStats }) {
           </CardHeader>
           <CardContent className="text-muted-foreground px-4 text-sm tabular-nums">
             {column.share !== undefined
-              ? `${formatNumber(column.share, SHARE_FORMAT).text} of ${base} (${baseTotal})`
-              : `${base} total is 0`}
+              ? `${formatNumber(column.share, SHARE_FORMAT).text} of ${baseTotal} companies`
+              : "Nema firmi."}
           </CardContent>
         </Card>
       ))}

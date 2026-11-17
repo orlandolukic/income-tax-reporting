@@ -10,7 +10,7 @@ export type CompanyCell = {
   format?: string; // Excel number format; missing = "General"
   formula?: boolean;
   editable?: boolean;
-  text?: boolean; // company detail edited as text (Company Registry); read-only on Home
+  text?: boolean; // company detail edited as text (Edit Company Data); read-only on Home
   edited?: boolean;
   original?: CellValue; // Excel value of an edited cell
 };
@@ -20,13 +20,11 @@ export type ColumnTotal = {
   key: string;
   header: string | null;
   total: number;
-  share?: number; // total / kom total; missing when the kom total is 0
+  share?: number; // total / number of companies (kom = 1 each); missing without companies
 };
-/** Totals under the Home table, computed by the server. */
+/** Totals above the Home table, computed by the server. */
 export type TableStats = {
-  base_key: string;
-  base_header: string | null;
-  base_total: number;
+  base_total: number; // kom total = number of companies (kom = 1 for every company)
   columns: ColumnTotal[];
 };
 export type CompanyTableData = {
@@ -80,7 +78,7 @@ export function useCompanyTable(year: number | null, options: Options) {
         if (controller.signal.aborted) return;
         logger.error(`Failed to load company table for ${year}`, err);
         setData(null);
-        setError("Unable to load company data for this reporting year.");
+        setError("Podaci firmi za ovu godinu nisu mogli da se učitaju.");
       })
       .finally(() => {
         if (!controller.signal.aborted) setLoading(false);

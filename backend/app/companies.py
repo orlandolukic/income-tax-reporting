@@ -1,7 +1,6 @@
 """Company table API: GFI values (columns A..N) with user edits applied on top.
 
-The data comes from PostgreSQL when DATABASE_URL is set, otherwise from the Excel
-workbook with edits in SQLite (see app.gfi_store).
+The data comes from PostgreSQL (see app.gfi_store).
 """
 
 import math
@@ -10,18 +9,18 @@ from fastapi import APIRouter, Depends, HTTPException, status
 from pydantic import BaseModel
 
 from app.auth import require_user
-from app.gfi_store import Edits, clean_text, edit_kind, get_gfi_store
-from app.models import FORMULA_FIELDS
-from app.gfi_workbook import CellValue, SourceTable
+from app.gfi_store import Edits, clean_text, edit_kind, get_gfi_store, status_value
+from app.models import FORMULA_FIELDS, KOM
+from app.gfi_table import CellValue, SourceTable
 from app.logging_config import get_logger
 
 logger = get_logger(__name__)
 
 router = APIRouter(prefix="/api/reporting-years/{year}", tags=["companies"])
 
-# Statistics under the Home table: totals of these fields and their share of the kom total.
+# Statistics above the Home table: totals of these fields and their share of the kom total,
+# i.e. of the number of companies (kom = 1 for every company).
 STATS_FIELDS = ("preliminarni", "gfi_uradjen", "gfi_za_rad")
-STATS_BASE_FIELD = "kom"
 
 
 class Column(BaseModel):
@@ -48,15 +47,14 @@ class ColumnTotal(BaseModel):
     key: str  # column letter
     header: str | None  # original header text
     total: int | float
-    share: float | None = None  # total / kom total (0.085 = 8.5 %); omitted when the kom total is 0
+    share: float | None = None  # total / number of companies (0.085 = 8.5 %); omitted without companies
 
 
 class TableStats(BaseModel):
-    """Statistics shown under the Home table: column totals and their share of the kom total."""
+    """Statistics shown above the Home table: column totals and their share of the kom total
+    (the number of companies, kom being 1 for every company)."""
 
-    base_key: str  # kom column letter
-    base_header: str | None
-    base_total: int | float
+    base_total: int | float  # kom total = number of companies
     columns: list[ColumnTotal]  # Preliminarni, GFI uradjen, GFI ZA RAD (table order)
 
 
@@ -91,12 +89,19 @@ def _number(value: CellValue) -> int | float:
 def apply_formulas(source: SourceTable, cells: dict[str, Cell]) -> None:
     """Compute the formula columns of one row from its current values (edits included)."""
     col_of = {field: col for col, field in source.fields.items()}
+
+    def operand(name: str | int) -> int | float:
+        if isinstance(name, int):
+            return name  # a constant (kom = 1)
+        col = col_of.get(name)
+        return _number(cells[col].value if col in cells else None)
+
     for field, (minuend, subtrahend) in FORMULA_FIELDS.items():
-        col, a, b = col_of.get(field), col_of.get(minuend), col_of.get(subtrahend)
-        if not (col and a and b) or col not in cells:
+        col = col_of.get(field)
+        if col is None or col not in cells or not all(isinstance(o, int) or o in col_of for o in (minuend, subtrahend)):
             continue
         cell = cells[col]
-        cell.value = _number(cells[a].value if a in cells else None) - _number(cells[b].value if b in cells else None)
+        cell.value = operand(minuend) - operand(subtrahend)
         cell.formula, cell.editable, cell.text, cell.edited, cell.original = True, False, False, False, None
 
 
@@ -132,21 +137,18 @@ def _total(rows: list[Row], column: str) -> int | float:
 
 def build_stats(source: SourceTable, rows: list[Row]) -> TableStats | None:
     """Totals of STATS_FIELDS over all companies (current values, formulas computed; an
-    empty cell counts as 0) and each total's share of the kom total."""
+    empty cell counts as 0) and each total's share of the kom total (KOM per company)."""
     col_of = {field: col for col, field in source.fields.items()}
-    base_col = col_of.get(STATS_BASE_FIELD)
-    if base_col is None or any(field not in col_of for field in STATS_FIELDS):
+    if any(field not in col_of for field in STATS_FIELDS):
         return None
-    base_total = _total(rows, base_col)
+    base_total = KOM * len(rows)
     columns = []
     for field in STATS_FIELDS:
         col = col_of[field]
         total = _total(rows, col)
         share = total / base_total if base_total else None
         columns.append(ColumnTotal(key=col, header=source.headers.get(col), total=total, share=share))
-    return TableStats(
-        base_key=base_col, base_header=source.headers.get(base_col), base_total=base_total, columns=columns
-    )
+    return TableStats(base_total=base_total, columns=columns)
 
 
 def build_company_table(source: SourceTable, edits: Edits) -> CompanyTable:
@@ -177,18 +179,19 @@ def update_cell(
     source, _ = store.load(year)
     src = source.rows.get(row, {}).get(column)
     if src is None:
-        raise HTTPException(status.HTTP_404_NOT_FOUND, f"Cell {column}{row} not found")
+        raise HTTPException(status.HTTP_404_NOT_FOUND, f"Polje {column}{row} ne postoji.")
     kind = edit_kind(source, column, src)
     if kind is None:
         logger.warning("Rejected edit of read-only cell %s!%s%d by '%s'", source.workbook, column, row, username)
-        raise HTTPException(status.HTTP_409_CONFLICT, f"Cell {column}{row} is read-only")
+        raise HTTPException(status.HTTP_409_CONFLICT, f"Polje {column}{row} je samo za čitanje.")
     value = update.value
     if kind == "number":
         if isinstance(value, str) or (value is not None and not math.isfinite(value)):
-            raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, "Value must be a finite number")
+            raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, "Vrednost mora biti broj.")
+        value = status_value(source.fields.get(column), value)
     else:
         if value is not None and not isinstance(value, str):
-            raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, "Value must be text")
+            raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, "Vrednost mora biti tekst.")
         value = clean_text(source.fields.get(column), value)
 
     edited = store.save(year, row, column, kind, value, src.value, username)

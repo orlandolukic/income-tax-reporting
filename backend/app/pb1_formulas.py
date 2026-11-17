@@ -39,13 +39,11 @@ SHEET_TABS = {
 
 FORMULAS: dict[str, dict[str, str]] = {
     "poreski-bilans": {
-        "F1": '=+E1*2',
+        # C3 / D3 (Klasa 5 / Klasa 6) are no longer formulas (=E3+J15, =F3+J19) but amounts entered
+        # directly, and F1 (=E1*2) is gone with columns E and F of the head rows (user, 2026-11-15).
         "J1": '=+C3/J2*100',
         "K1": '=+D3/K2*100',
-        "C3": '=E3+J15',
-        "D3": '=F3+J19',
         "C5": '=IF(D3<C3,D3-C3,0)',
-        "C6": '=D3',
         "L6": '=+M3',
         "C7": '=IF(D3>C3,D3-C3,0)',
         "L7": '=+M3-L3',
@@ -55,22 +53,22 @@ FORMULAS: dict[str, dict[str, str]] = {
         "K25": '=+I25+J25',
         "K26": '=+I26+J26',
         "K28": '=+I28+J28',
-        "D29": '=+K29',
+        # D29 (line 21, amortization for tax purposes) was =+K29, a helper outside the form that
+        # only the file's company has: an amount entered per company now (user, 2026-11-16).
         "I29": '=+I25+I28+I26+I27',
         "J29": '=+J25+J28+J26+J27',
         "K29": '=+K25+K28+K26+K27',
         "N29": '=+M28-M29',
-        "D30": '=D3*F30',
-        "E30": '=IF(C30>D30,C30-D30,0)',
-        "D31": '=D3*F31',
-        "E31": '=IF(C31>D31,C31-D31,0)',
-        "D32": '=D3*F32',
-        "E32": '=IF(C32>D32,C32-D32,0)',
+        # Lines 22-25 (limits): the limit (Klasa 6 x rate) is the recognized amount, in Priznati
+        # troskovi (C); the actual expense is entered in Ostvareni troskovi (D). The workbook had
+        # them the other way round (user, 2026-11-17: columns swapped, migration 0021).
+        "C30": '=D3*F30',
+        "C31": '=D3*F31',
+        "C32": '=D3*F32',
         "I32": '=D28-D29',
-        "D33": '=D3*F33',
-        "E33": '=IF(C33>D33,C33-D33,0)',
+        "C33": '=D3*F33',
         "C70": '=+C67',
-        "C74": '=C5+C7+D12+D14+D15+D16+D17+D18+D19+D20+D21+D22+D23+D24+D25-D29+E30+E31+E32+E33+D34+D36+D37+D39+D40+D41+D43+D47+D48+D49+D50+D51+D52+D53+D54+C70+C72-D11-D15-D22-D26-D27+D28-D35-D38-D42-D44-D45-D55-D56-D57-D58-D59-D60',
+        "C74": '=C5+C7+D12+D14+D15+D16+D17+D18+D19+D20+D21+D22+D23+D24+D25-D29+IF(E30>0,E30,0)+IF(E31>0,E31,0)+IF(E32>0,E32,0)+IF(E33>0,E33,0)+D34+D36+D37+D39+D40+D41+D43+D47+D48+D49+D50+D51+D52+D53+D54+C70+C72-D11-D15-D22-D26-D27+D28-D35-D38-D42-D44-D45-D55-D56-D57-D58-D59-D60',
         "C77": '=+C74-C76',
         "C86": '=C77+C80',
         "J86": '=+C86/I86*100',
@@ -78,6 +76,9 @@ FORMULAS: dict[str, dict[str, str]] = {
         "I87": '=+I86*0.15',
         "J87": '=+C87/I87*100',
         "M87": '=+C87/L87*100',
+        # Porez 15%: typed in the workbook; computed in the app (user, 2026-11-16): 15 % of a
+        # positive tax base, else 0 (the same as the loss rule).
+        "C87": '=IF(C86>0,C86*0.15,0)',
         "C88": '=C87/D1',
         "I88": '=+I87/12',
         "J88": '=+C88/I88*100',
@@ -115,9 +116,19 @@ FORMULAS: dict[str, dict[str, str]] = {
         "E23": '=+C23/D23',
         "C25": '=C18/C20',
         "D25": '=D18/D20',
+        # Index of every line = <year> / <year-1>, as in the other lines (user, 2026-11-17);
+        # these cells were blank in the workbook (ADDED_FORMULAS: not checked against the file).
+        "E10": '=+C10/D10',
+        "E11": '=+C11/D11',
+        "E14": '=+C14/D14',
+        "E17": '=+C17/D17',
+        "E18": '=+C18/D18',
+        "E21": '=+C21/D21',
+        "E22": '=+C22/D22',
+        "E25": '=+C25/D25',
     },
     "preliminarni": {
-        "G3": "='Poreski bilans'!E33",
+        "G3": "=IF('Poreski bilans'!E33>0,'Poreski bilans'!E33,0)",  # only an actual overrun
         "H3": "='Poreski bilans'!L33",
         "I3": '=+G3/H3*100',
         "C5": "=+'Poreski bilans'!D3",
@@ -160,6 +171,29 @@ FORMULAS: dict[str, dict[str, str]] = {
         "G25": '=SUM(G20:G24)',
         "C26": '=C19/C21',
     },
+}
+
+# Formulas the app adds where the workbook has none (its cells blank): not compared with the
+# file's stored results by verify_formulas (there is no result to compare with).
+# Poreski bilans: Prekoracenje (E) = Ostvareni troskovi (D) - Priznati troskovi (C) in every form
+# line (user, 2026-11-17), negative too; only a positive overrun counts in Oporeziva dobit (C74)
+# and in Preliminarni rezultat (G3).
+# Not the total lines 57 (row 70), 59 Oporeziva dobit (74) and 62 Ostatak oporezive dobiti (77):
+# their Prekoracenje is empty (user, 2026-11-17: they are totals, not items).
+OVERRUN_ROWS = (
+    7, 8, 9, 11, 12, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32, 33, 34,
+    35, 36, 37, 38, 39, 40, 41, 42, 43, 44, 45, 47, 48, 49, 50, 51, 52, 53, 54, 55, 56, 57, 58, 59, 60,
+    62, 63, 64, 65, 67, 68, 72, 75, 76, 79, 80, 81, 82, 83, 84,
+)
+for _row in OVERRUN_ROWS:
+    FORMULAS["poreski-bilans"][f"E{_row}"] = f"=D{_row}-C{_row}"
+# Poreska osnovica = the sum of the positive overruns of every line (user, 2026-11-17; was
+# C77 + C80); Porez 15% and Mesecna akontacija follow it as before.
+FORMULAS["poreski-bilans"]["C86"] = "=" + "+".join(f"IF(E{r}>0,E{r},0)" for r in OVERRUN_ROWS)
+
+ADDED_FORMULAS: dict[str, frozenset[str]] = {
+    "uporedo": frozenset({"E10", "E11", "E14", "E17", "E18", "E21", "E22", "E25"}),
+    "poreski-bilans": frozenset({*(f"E{r}" for r in OVERRUN_ROWS), "C86"}),
 }
 
 
@@ -468,3 +502,32 @@ def verify_formulas(raw: dict[str, dict[str, object]], cells: dict[str, set[str]
             if not ok:
                 mismatches.append(f"{tab}!{address}: computed {computed!r}, Excel {stored!r}")
     return mismatches
+
+
+def unverified_formulas() -> dict[str, set[str]]:
+    """Per tab, the formulas not compared with the workbook's stored results: the ones the app
+    added or changed (ADDED_FORMULAS) and every formula that depends on one of them, directly or
+    through others (e.g. Porez 15% on Poreska osnovica): the file holds no results for them."""
+    added = {(tab, a) for tab, addresses in ADDED_FORMULAS.items() for a in addresses}
+    memo: dict[tuple[str, str], bool] = {}
+
+    def depends(key: tuple[str, str], seen: frozenset) -> bool:
+        if key in added:
+            return True
+        if key in memo:
+            return memo[key]
+        formula = FORMULAS.get(key[0], {}).get(key[1])
+        result = False
+        if formula is not None and key not in seen:
+            refs = [c for t in _tokens(formula, key[0]) if isinstance(t, _Ref) for c in t.cells]
+            result = any(depends(r, seen | {key}) for r in refs)
+        memo[key] = result
+        return result
+
+    out: dict[str, set[str]] = {}
+    for tab, formulas in FORMULAS.items():
+        for address in formulas:
+            if depends((tab, address), frozenset()):
+                out.setdefault(tab, set()).add(address)
+    return out
+

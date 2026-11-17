@@ -1,14 +1,11 @@
-"""Where GFI data comes from, and which cells can be edited.
+"""GFI data in PostgreSQL, and which cells can be edited.
 
-- PostgresGfiStore: used when DATABASE_URL is set. The data is imported once with
-  `python -m app.gfi_import <year>`; the Excel workbook is not read by the API.
-- ExcelGfiStore: the workbook (read-only) plus user edits in SQLite. Used when no
-  database is configured.
+GfiStore reads and writes the database only. The data gets in once per year through
+`python -m app.gfi_import <year>` (or the Migracija page); the app never opens a workbook.
+It returns a SourceTable with the original values (the import snapshot) and the edits
+(current values that differ from them), which the API shows on top.
 
-Both return the same shapes (SourceTable with the original values + edits applied on top
-by the API), so the API responses and the frontend are the same in both modes.
-
-Editing rules (same in both modes, see edit_kind):
+Editing rules (see edit_kind):
 - GFI ZA RAD and PB-1,PB-2 za rad are formulas in every row (FORMULA_FIELDS: kom - GFI
   uradjen, PB-1,PB-2 - Predat; empty counts as 0), computed by the API, never editable;
 - the other numeric GFI status columns (kom, Preliminarni, GFI uradjen, PB-1,PB-2,
@@ -18,31 +15,28 @@ Editing rules (same in both modes, see edit_kind):
 - company details (NAZIV, PIB, REFERENT, office): text. The Home page shows these
   read-only; the Company Registry page edits them;
 - everything else (unmapped columns): read-only.
-Only the company list is returned (gfi_workbook.company_list): 165 rows for 2025, without
-the R.B. columns. "#" in the frontend is the position in that list.
+Only the company list is stored (gfi_workbook.company_list at import): 165 rows for 2025,
+without the R.B. columns. "#" in the frontend is the position in that list.
 Company identity is the Excel row (company_year in the database). A PB-1 file is linked
 to that identity once and the link is stored (pb1_link), so editing a company's name or
 PIB never changes which company a PB-1 file belongs to.
 """
 
-import dataclasses
 import re
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from decimal import Decimal
-from typing import Literal, Protocol
+from typing import Literal
 
 from fastapi import HTTPException, status
 from sqlalchemy import delete, select
 from sqlalchemy.orm import Session, joinedload
 
-from app import edits_store
-from app.db import database_enabled, session_scope
-from app.gfi_workbook import CellValue, SourceCell, SourceTable, company_list, load_source_table
+from app.db import session_scope
+from app.gfi_table import CellValue, SourceCell, SourceTable
 from app.logging_config import get_logger
 from app.models import NUMERIC_FIELDS, ChangeLog, CompanyYear, GfiColumn, Office, Pb1Link, Referent, SourceFile
 from app.models import SourceCell as SourceCellRow
-from app.reporting_years import find_reporting_years, get_data_dir, get_workbook_path
 
 logger = get_logger(__name__)
 
@@ -55,7 +49,6 @@ HEADER_FIELDS = {
     "NAZIV": "name",
     "PIB": "pib",
     "REFERENT": "referent",
-    "KOM": "kom",
     "PRELIMINARNI": "preliminarni",
     "GFIURADJEN": "gfi_uradjen",
     "GFIZARAD": "gfi_za_rad",
@@ -66,9 +59,20 @@ HEADER_FIELDS = {
 # The unnamed column right after REFERENT holds the office (SLAVIJA, FER, LJILJA, ...).
 OFFICE_FIELD = "office"
 REQUIRED_FIELDS = (*HEADER_FIELDS.values(), OFFICE_FIELD)
-# Company details, edited as text (Company Registry page).
+# Company details, edited as text (Edit Company Data page).
 TEXT_FIELDS = ("name", "pib", "referent", OFFICE_FIELD)
-PIB_INPUT = re.compile(r"^\d+$")
+# Input rules (user's decisions, 2026-11-14), the same on every page; the frontend applies them
+# while typing, the backend enforces them:
+# - NAZIV, REFERENT, office: upper case (as with caps lock on);
+# - PIB: digits only, 9 (PIB of a company) or 13 (JMBG of a natural person); empty is allowed;
+# - status columns (Preliminarni, GFI uradjen, PB-1, PB-2, Predat): 0 or 1, never empty: an
+#   empty value is stored as 0 (also at import and construction; the database refuses empty);
+# - PIB, REFERENT, office: "-" (shown for an empty one) entered as a value means empty.
+# Upper case applies to edits; values from an import or a construction are stored as they are.
+PIB_INPUT = re.compile(r"^(\d{9}|\d{13})$")
+UPPER_CASE_FIELDS = ("name", "referent", OFFICE_FIELD)
+STATUS_VALUES = (0, 1)
+EMPTY_MARK = "-"
 
 
 def normalize_header(header: str | None) -> str:
@@ -100,9 +104,9 @@ def edit_kind(source: SourceTable, column: str, cell: SourceCell) -> EditKind | 
     if field in TEXT_FIELDS:
         return None if cell.is_formula else "text"
     if field in NUMERIC_FIELDS:
-        if cell.is_formula:
-            return None
-        return "number" if cell.is_editable or is_blank(cell.value) else None
+        # The status columns (Preliminarni, GFI uradjen, PB-1, PB-2, Predat) are set only by the
+        # steps of the company's PB-1 reports, never by hand (user, 2026-11-17; app.pb1).
+        return None
     return None
 
 
@@ -129,13 +133,30 @@ def is_original(kind: EditKind, value: CellValue, original: CellValue) -> bool:
 
 
 def clean_text(field: str | None, value: str | None) -> str | None:
-    """Validate and normalize a text edit. Raises HTTPException 422."""
+    """Validate and normalize a text edit (see the input rules above). Raises HTTPException 422."""
     value = value.strip() if value is not None else None
     value = value or None
+    if value == EMPTY_MARK and field != "name":
+        value = None  # "-" is how an empty detail is shown: entered, it means empty
+    if field in UPPER_CASE_FIELDS and value is not None:
+        value = value.upper()
     if field == "name" and value is None:
-        raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, "Company name can't be empty")
+        raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, "Naziv firme ne može biti prazan.")
     if field == "pib" and value is not None and not PIB_INPUT.match(value):
-        raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, "PIB may contain digits only")
+        raise HTTPException(
+            status.HTTP_422_UNPROCESSABLE_ENTITY, "PIB mora imati 9 cifara, ili 13 cifara za JMBG fizičkog lica."
+        )
+    return value
+
+
+def status_value(field: str | None, value: float | int | None) -> float | int | None:
+    """A status column (Preliminarni ... Predat) takes only 0 or 1; empty means 0. Raises 422."""
+    if field not in NUMERIC_FIELDS:
+        return value
+    if value is None:
+        return 0
+    if value not in STATUS_VALUES:
+        raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, "Dozvoljene su samo vrednosti 0 i 1.")
     return value
 
 
@@ -156,77 +177,9 @@ class StoredPb1Link:
     row: int | None  # Excel row of the linked company in the current company list (None: not in it)
 
 
-class GfiStore(Protocol):
-    name: str
+class GfiStore:
+    """GFI data in PostgreSQL: the years, the tables, cell edits and the PB-1 link."""
 
-    def pb1_link(self, year: int, pb1_file: str) -> StoredPb1Link | None: ...
-
-    def save_pb1_link(self, year: int, pb1_file: str, pb1_company: str, row: int, user: str) -> None: ...
-
-    def delete_pb1_link(self, year: int, pb1_file: str) -> None: ...
-
-    def years(self) -> list[int]: ...
-
-    def load(self, year: int) -> tuple[SourceTable, Edits]:
-        """The GFI table with original values, and the edits to show on top of it."""
-        ...
-
-    def save(
-        self, year: int, row: int, column: str, kind: EditKind, value: CellValue, original: CellValue, user: str
-    ) -> bool:
-        """Store a new value for an editable cell. Returns True if it now differs from the original."""
-        ...
-
-
-class ExcelGfiStore:
-    name = "Excel + SQLite"
-
-    def pb1_link(self, year: int, pb1_file: str) -> StoredPb1Link | None:
-        link = edits_store.get_pb1_link(year, pb1_file)
-        if link is None:
-            return None
-        pb1_company, gfi_workbook, gfi_row = link
-        current = get_workbook_path(year).name
-        # A link to another GFI workbook (file replaced) doesn't identify a row of this one.
-        return StoredPb1Link(pb1_company, gfi_row if gfi_workbook == current else None)
-
-    def save_pb1_link(self, year: int, pb1_file: str, pb1_company: str, row: int, user: str) -> None:
-        edits_store.save_pb1_link(year, pb1_file, pb1_company, get_workbook_path(year).name, row, user)
-
-    def delete_pb1_link(self, year: int, pb1_file: str) -> None:
-        edits_store.delete_pb1_link(year, pb1_file)
-
-    def years(self) -> list[int]:
-        return find_reporting_years(get_data_dir())
-
-    def load(self, year: int) -> tuple[SourceTable, Edits]:
-        path = get_workbook_path(year)
-        try:
-            source = company_list(load_source_table(path))
-        except Exception:
-            logger.exception("Failed to read GFI workbook %s", path.name)
-            raise HTTPException(status.HTTP_500_INTERNAL_SERVER_ERROR, "Unable to read the workbook")
-        try:
-            fields = map_columns(source.headers)
-        except ValueError as exc:
-            logger.warning("%s: %s; only plain numeric cells are editable", path.name, exc)
-            fields = {}
-        source = dataclasses.replace(source, fields=fields)
-        return source, edits_store.get_edits(source.workbook, source.sheet)
-
-    def save(
-        self, year: int, row: int, column: str, kind: EditKind, value: CellValue, original: CellValue, user: str
-    ) -> bool:
-        source, _ = self.load(year)
-        if is_original(kind, value, original):
-            # Back to the Excel value: drop the override instead of storing a copy.
-            edits_store.delete_edit(source.workbook, source.sheet, row, column)
-            return False
-        edits_store.save_edit(source.workbook, source.sheet, row, column, value, original, user)
-        return True
-
-
-class PostgresGfiStore:
     name = "PostgreSQL"
 
     def pb1_link(self, year: int, pb1_file: str) -> StoredPb1Link | None:
@@ -264,12 +217,14 @@ class PostgresGfiStore:
             )
 
     def load(self, year: int) -> tuple[SourceTable, Edits]:
+        """The GFI table with original values, and the edits to show on top of it."""
         with session_scope() as session:
             return load_table(session, year)
 
     def save(
         self, year: int, row: int, column: str, kind: EditKind, value: CellValue, original: CellValue, user: str
     ) -> bool:
+        """Stores a new value for an editable cell. Returns True if it now differs from the original."""
         with session_scope() as session:
             source_file = _source_file(session, year)
             field = session.scalar(
@@ -282,7 +237,7 @@ class PostgresGfiStore:
             )
             allowed = NUMERIC_FIELDS if kind == "number" else TEXT_FIELDS
             if field not in allowed or company_year is None:
-                raise HTTPException(status.HTTP_409_CONFLICT, f"Cell {column}{row} is read-only")
+                raise HTTPException(status.HTTP_409_CONFLICT, f"Polje {column}{row} je samo za čitanje.")
             now = datetime.now(timezone.utc)
             log = ChangeLog(
                 company_year_id=company_year.id, year=year, source_row=row, col=column, field=field,
@@ -356,7 +311,7 @@ def _source_file(session: Session, year: int) -> SourceFile:
     source_file = session.scalar(select(SourceFile).where(SourceFile.kind == "gfi", SourceFile.year == year))
     if source_file is None:
         logger.warning("No GFI data in the database for reporting year %s", year)
-        raise HTTPException(status.HTTP_404_NOT_FOUND, f"No GFI data for reporting year {year}")
+        raise HTTPException(status.HTTP_404_NOT_FOUND, f"Nema GFI podataka za godinu {year}.")
     return source_file
 
 
@@ -405,15 +360,9 @@ def load_table(session: Session, year: int) -> tuple[SourceTable, Edits]:
             if text_of(current) != text_of(original):
                 edits[(cell.row, cell.col)] = (current, original)
         elif field in NUMERIC_FIELDS:
-            current = from_decimal(getattr(cy, field))
-            is_number = isinstance(original, (int, float)) and not isinstance(original, bool)
-            if cell.is_formula and is_number:
-                value = current  # formula result as stored (read-only)
-            elif is_number and not cell.is_formula and current != original:
-                edits[(cell.row, cell.col)] = (current, original)
-            elif is_blank(original) and not cell.is_formula and current is not None:
-                edits[(cell.row, cell.col)] = (current, original)  # an empty cell that was filled in
-            # Other text in a numeric column (e.g. "#REF!") stays as in the snapshot.
+            # A status column: always its current value, set only by the PB-1 report steps (user,
+            # 2026-11-17); not an edit of the workbook value (the snapshot keeps that).
+            value = from_decimal(getattr(cy, field))
         rows.setdefault(cell.row, {})[cell.col] = SourceCell(
             value=value,
             number_format=cell.number_format,
@@ -433,4 +382,4 @@ def load_table(session: Session, year: int) -> tuple[SourceTable, Edits]:
 
 
 def get_gfi_store() -> GfiStore:
-    return PostgresGfiStore() if database_enabled() else ExcelGfiStore()
+    return GfiStore()

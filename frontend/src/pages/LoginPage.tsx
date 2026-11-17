@@ -1,5 +1,6 @@
 import { useState, type FormEvent } from "react";
-import { Loader2, Workflow } from "lucide-react";
+import { Loader2 } from "lucide-react";
+import { AppLogo } from "@/components/AppLogo";
 import { Navigate, useNavigate } from "react-router";
 import { useAuth } from "@/auth/AuthContext";
 import { Alert, AlertDescription } from "@/components/ui/alert";
@@ -30,12 +31,12 @@ export default function LoginPage() {
       if (await login(username, password)) {
         navigate("/", { replace: true });
       } else {
-        setError("Invalid username or password.");
+        setError("Pogrešno korisničko ime ili lozinka.");
         setPassword("");
       }
     } catch (err) {
       logger.error("Login request failed", err);
-      setError("Unable to reach the server. Please try again.");
+      setError("Server nije dostupan. Pokušajte ponovo.");
     } finally {
       setSubmitting(false);
     }
@@ -45,22 +46,20 @@ export default function LoginPage() {
     <div className="bg-muted/40 flex min-h-svh items-center justify-center p-4">
       <div className="flex w-full max-w-sm flex-col gap-6">
         <div className="flex items-center justify-center gap-2">
-          <div className="bg-primary text-primary-foreground flex size-8 items-center justify-center rounded-lg">
-            <Workflow className="size-4" />
-          </div>
+          <AppLogo />
           <span className="text-xl font-semibold">Income Tax Reporting</span>
         </div>
         <Card className="gap-4">
           <CardHeader>
             <CardTitle className="text-lg tracking-tight">Login</CardTitle>
-            <CardDescription>Enter your username and password to log into your account.</CardDescription>
+            <CardDescription>Unesite korisničko ime i lozinku za prijavu.</CardDescription>
           </CardHeader>
           <CardContent>
             <form onSubmit={handleSubmit} className="grid gap-4">
               {sessionExpired && (
                 <Alert>
                   <AlertDescription>
-                    Your session has expired. Log in again; unsaved table changes are kept and will be saved.
+                    Sesija je istekla. Prijavite se ponovo; nesačuvane izmene u tabelama su zadržane i biće sačuvane.
                   </AlertDescription>
                 </Alert>
               )}

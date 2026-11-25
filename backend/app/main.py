@@ -39,7 +39,7 @@ async def lifespan(app: FastAPI):
     logger.info("Backend stopped")
 
 
-app = FastAPI(title="Income Tax Reporting", lifespan=lifespan)
+app = FastAPI(title="Izveštavanje o porezu na dobit", lifespan=lifespan)
 
 app.add_middleware(
     CORSMiddleware,

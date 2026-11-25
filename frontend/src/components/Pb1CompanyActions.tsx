@@ -99,8 +99,8 @@ export function Pb1CompanyActions({
   return (
     <div className="grid gap-2">
       <div className="flex flex-wrap items-center gap-2">
-        {button("save", "Save changes", <Save />, onSave)}
-        {button("report", "Generate PDF report", <FileText />, onReport)}
+        {button("save", "Sačuvaj izmene", <Save />, onSave)}
+        {button("report", "Napravi PDF izveštaj", <FileText />, onReport)}
         {message?.kind === "ok" && <span className="text-success text-sm">{message.text}</span>}
       </div>
       {message?.kind === "error" && (

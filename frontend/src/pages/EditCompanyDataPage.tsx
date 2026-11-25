@@ -11,8 +11,8 @@ export default function EditCompanyDataPage() {
   return (
     <Main>
       <GfiTableView
-        title="Edit Company Data"
-        description="Ovde se menjaju naziv firme, PIB, referent i kancelarija (samo na ovoj stranici). Statusne kolone se ne menjaju ručno: postavljaju ih koraci u PB-1 (preliminarni gotov, GFI gotov, konačni gotov, predat). Izmene se čuvaju automatski i vide se i na Home."
+        title="Izmena podataka firmi"
+        description="Ovde se menjaju naziv firme, PIB, referent i kancelarija (samo na ovoj stranici). Statusne kolone se ne menjaju ručno: postavljaju ih koraci u PB-1 (preliminarni gotov, GFI gotov, konačni gotov, predat). Izmene se čuvaju automatski i vide se i na Početnoj."
         variant="registry"
       />
     </Main>

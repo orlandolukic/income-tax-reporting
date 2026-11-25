@@ -47,11 +47,11 @@ export default function LoginPage() {
       <div className="flex w-full max-w-sm flex-col gap-6">
         <div className="flex items-center justify-center gap-2">
           <AppLogo />
-          <span className="text-xl font-semibold">Income Tax Reporting</span>
+          <span className="text-xl font-semibold">Izveštavanje o porezu na dobit</span>
         </div>
         <Card className="gap-4">
           <CardHeader>
-            <CardTitle className="text-lg tracking-tight">Login</CardTitle>
+            <CardTitle className="text-lg tracking-tight">Prijava</CardTitle>
             <CardDescription>Unesite korisničko ime i lozinku za prijavu.</CardDescription>
           </CardHeader>
           <CardContent>
@@ -64,7 +64,7 @@ export default function LoginPage() {
                 </Alert>
               )}
               <div className="grid gap-2">
-                <Label htmlFor="username">Username</Label>
+                <Label htmlFor="username">Korisničko ime</Label>
                 <Input
                   id="username"
                   value={username}
@@ -74,7 +74,7 @@ export default function LoginPage() {
                 />
               </div>
               <div className="grid gap-2">
-                <Label htmlFor="password">Password</Label>
+                <Label htmlFor="password">Lozinka</Label>
                 <Input
                   id="password"
                   type="password"
@@ -92,7 +92,7 @@ export default function LoginPage() {
               )}
               <Button type="submit" className="mt-2" disabled={submitting}>
                 {submitting && <Loader2 className="animate-spin" />}
-                Log in
+                Prijavi se
               </Button>
             </form>
           </CardContent>

@@ -159,3 +159,14 @@
 [data-slot="select-item"]:not([data-disabled]) {
   cursor: pointer;
 }
+
+/* A PB-1 field with a fixed, computed value (not editable; user 2026-11-25): grey with a fine
+   diagonal hatch, so it reads apart from the plain grey of the section rows. Tokens only. */
+@utility bg-locked {
+  background-color: color-mix(in oklch, var(--muted) 85%, transparent);
+  background-image: repeating-linear-gradient(
+    -45deg,
+    color-mix(in oklch, var(--foreground) 7%, transparent) 0 1px,
+    transparent 1px 6px
+  );
+}

@@ -374,6 +374,12 @@ class Pb1Store:
 
     # --- the two reports (preliminary, final) ---
 
+    def form_type(self, year: int, company: CompanyKey) -> str:
+        """The company's type in that year: "pdp" or "ppdg" (PPDG-1S); "pdp" when not found."""
+        with self._scope() as session:
+            company_year = self._company_year(session, year, company)
+            return company_year.form_type if company_year is not None else "pdp"
+
     def report_state(self, year: int, company: CompanyKey) -> ReportState:
         with self._scope() as session:
             company_year = self._company_year(session, year, company)

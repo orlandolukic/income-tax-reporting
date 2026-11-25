@@ -23,6 +23,8 @@ from dataclasses import dataclass, field, replace
 
 
 from app.logging_config import get_logger
+from app.pb1_formulas import SECTION_SUBTOTALS
+from app.pb1_official import OFFICIAL_LINES
 from app.pb1_texts import correct_text
 
 logger = get_logger(__name__)
@@ -103,6 +105,8 @@ class Pb1TabSpec:
     # but are not shown in their row (Pb1Cell.hidden).
     section_rows_empty: bool = False
     section_hidden: frozenset[tuple[int, str]] = frozenset()
+    # Section cells that stay and are shown, as (row, column): e.g. a computed subtotal.
+    section_shown: frozenset[tuple[int, str]] = frozenset()
     # An extra head row below the last one (label, the address whose value it shows, the label's
     # column, the value's column, the value's fill); the label with the fill of the label row
     # above; read-only.
@@ -116,17 +120,24 @@ class Pb1TabSpec:
     plain_cells: frozenset[tuple[int, str]] = frozenset()
     # Single cells that are not part of the form (not shown, not stored), as (row, column).
     dropped_cells: frozenset[tuple[int, str]] = frozenset()
+    # Whole rows that are not part of the form (not shown, not stored), as (row, start of the
+    # original description); skipped (WARNING) when the description doesn't match.
+    dropped_rows: tuple[tuple[int, str], ...] = ()
     # Column whose positive values are shown red (Poreski bilans: Prekoracenje, an overrun).
     overrun_column: str | None = None
     # Single read-only cells, as (row, column): e.g. value cells of a section heading row.
     readonly_cells: frozenset[tuple[int, str]] = frozenset()
+    # Text colour of single cells, as ((row, column), tone): "expense" red, "income" green.
+    cell_tones: tuple[tuple[tuple[int, str], str], ...] = ()
 
 
 PB1_TABS: tuple[Pb1TabSpec, ...] = (
     Pb1TabSpec(
         key="poreski-bilans", sheet_prefix="Poreski bilans", columns=("A", "B", "C", "D", "E", "F", "G"),
         value_columns=frozenset("CDE"), wrap_columns=frozenset("BFG"), header_marker="red.br",
-        narrow_columns=frozenset("A"), header_overrides=(("G", "Konto"),), konto_columns=frozenset("G"),
+        narrow_columns=frozenset("A"), konto_columns=frozenset("G"),
+        # C / D hold amounts of every kind, not only expenses (user, 2026-11-22: "iznosi").
+        header_overrides=(("C", "Priznati iznosi"), ("D", "Ostvareni iznosi"), ("G", "Konto")),
         # "V. Poreska osnovica", line 69, Porez 15%, Mesecna akontacija: the total of the form.
         summary_label="B Poreska osnovica",
         # Rows 1-3: "PB 1 <year>", company name with "Klasa 5 | Klasa 6", and the class totals.
@@ -143,15 +154,24 @@ PB1_TABS: tuple[Pb1TabSpec, ...] = (
         form_values_are_amounts=True,
         plain_numbers=True,
         overrun_column="E",  # Prekoracenje = Ostvareni - Priznati; an overrun (> 0) is red
-        # The total lines 57, 59, 62 have no Prekoracenje; "V. Poreska osnovica" (row 85) is the
-        # heading of the closing rows, without a value (user, 2026-11-17; it was an amount field).
-        dropped_cells=frozenset({(70, "E"), (74, "E"), (77, "E"), (85, "C")}),
+        # "V. Poreska osnovica" (row 85) is the heading of the closing rows, without a value
+        # (user, 2026-11-17; it was an amount field). The Prekoracenje of lines 57, 59, 62
+        # (rows 70, 74, 77; dropped 2026-11-17) is back (user, 2026-11-25): 57 computed, part of
+        # the tax base; 59 and 62 a fixed 0,00 (ZERO_OVERRUN_ROWS), for a consistent look.
+        dropped_cells=frozenset({(85, "C")}),
+        # The workbook's line 32 "Iskoriscena dugorocna rezervisanja koja nisu bila priznata ..."
+        # is not a line of the current official form (user, 2026-11-22: removed; 33 follows 32).
+        dropped_rows=((41, "Iskoriscena dugorocna rezervisanja koja nisu bila priznata"),),
         # C5 (A. Poslovna dobit i gubitak: the loss Klasa 6 - Klasa 5 when negative, an input of
         # Oporeziva dobit C74) is not shown in its row; it is shown as a fourth head row, under
         # Klasa 5 / Klasa 6 (user, 2026-11-16).
         section_hidden=frozenset({(5, "C")}),
-        # The value in its own colour (user, 2026-11-16): light rose of the Excel palette.
-        head_result=("Gubitak (Klasa 6 - 5)", "C5", "C", "D", "#ffcccc"),
+        # The Prekoracenje subtotal of the Roman-numeral sections (user, 2026-11-25; computed,
+        # SECTION_SUBTOTALS in app/pb1_formulas.py).
+        section_shown=frozenset((r, "E") for r in SECTION_SUBTOTALS),
+        head_result=None,  # Saldo (Klasa 6 - 5) dropped (user, 2026-11-25): it is the Knjigovodstveni rezultat tile
+        # Klasa 5 (expenses) red, Klasa 6 (revenue) green, without a sign (user, 2026-11-25).
+        cell_tones=(((3, "C"), "expense"), ((3, "D"), "income")),
         # Form lines without an amount cell get the column their section uses:
         # I and V..B. Kapitalni dobici -> C (Priznati troskovi), III -> D (Ostvareni troskovi).
         amount_fixes=(
@@ -257,6 +277,8 @@ class Pb1Workbook:
     # cells hold Excel's last result), also the helper columns: inputs of the PB-1 formulas
     # (app.pb1_formulas) and the values they are checked against.
     raw: dict[str, dict[str, CellValue]] = field(default_factory=dict)
+    # Which form: "pdp" (the workbook's) or "ppdg" (PPDG-1S, app/pb1_ppdg.py).
+    variant: str = "pdp"
 
 
 def normalize_company_name(name: str) -> str:
@@ -468,7 +490,10 @@ def _read_sheet(sheet: SheetCells, spec: Pb1TabSpec) -> Pb1Sheet:
 
     # Form rows: from the start down; the form ends after more than max_empty_rows empty rows.
     empty_run = 0
+    removed = _removed_rows(sheet, spec, indexes)
     for r in range(start, sheet.nrows):
+        if r + 1 in removed:
+            continue  # not part of the form; doesn't end it either (the snapshot has no cells there)
         values = [_cell_value(sheet, r, c) for c in indexes]
         if all(v is None for v in values):
             empty_run += 1
@@ -491,6 +516,7 @@ def _read_sheet(sheet: SheetCells, spec: Pb1TabSpec) -> Pb1Sheet:
     _apply_amount_fixes(sheet.name, spec, rows)
     summary_start = _find_summary_start(sheet.name, spec, rows)
     dropped = _drop_cells(spec, rows, head_end, summary_start)
+    dropped |= {(r, _column_letter(c)) for r in removed for c in range(sheet.ncols)}
     if spec.form_values_are_amounts:
         _form_values_as_amounts(sheet.name, spec, rows, head_end, summary_start)
     # Typo corrections of the descriptive texts (after the fixes, which check the original texts).
@@ -499,6 +525,7 @@ def _read_sheet(sheet: SheetCells, spec: Pb1TabSpec) -> Pb1Sheet:
             if isinstance(cell.value, str) and any(ch.isalpha() for ch in cell.value):
                 cells[key] = replace(cell, value=correct_text(cell.value))
     headers = {key: correct_text(h) if h else h for key, h in headers.items()}
+    _apply_official_lines(sheet.name, spec, rows)
     for key in spec.narrow_columns:
         texts = [t for cells in rows.values() if (t := _short_text(cells[key].value))]
         widths[key] = max((len(t) for t in [*texts, "#"]), default=1)
@@ -513,6 +540,38 @@ def _read_sheet(sheet: SheetCells, spec: Pb1TabSpec) -> Pb1Sheet:
 
 
 DESCRIPTION_COLUMN = "B"
+
+
+def _line_number(value: CellValue) -> int | None:
+    """A line number in column A (1, 1.0, "1"); None when blank."""
+    if isinstance(value, bool) or value is None:
+        return None
+    if isinstance(value, (int, float)):
+        return int(value) if float(value).is_integer() else None
+    text = str(value).strip().rstrip(".")
+    return int(text) if text.isdigit() else None
+
+
+def _apply_official_lines(sheet_name: str, spec: Pb1TabSpec, rows: dict[int, dict[str, Pb1Cell]]) -> None:
+    """The official line numbers ("#", column A) and descriptions ("Opis", column B) of the
+    form (app/pb1_official.py), display only; an entry whose row doesn't hold the expected line
+    number of the workbook is skipped (WARNING)."""
+    for line in OFFICIAL_LINES.get(spec.key, ()):
+        cells = rows.get(line.row)
+        if cells is None or "A" not in cells or "B" not in cells:
+            logger.warning("%s: row %d for official line %s not found", sheet_name, line.row, line.number)
+            continue
+        found = _line_number(cells["A"].value)
+        if found != line.file_number:
+            logger.warning(
+                "%s: row %d has line number %s, expected %s; official line not applied",
+                sheet_name, line.row, found, line.file_number,
+            )
+            continue
+        if line.file_number is not None and line.number != line.file_number:
+            cells["A"] = replace(cells["A"], value=line.number)
+        if line.text:
+            cells["B"] = replace(cells["B"], value=line.text)
 
 
 def _form_values_as_amounts(sheet_name: str, spec: Pb1TabSpec, rows: dict[int, dict[str, Pb1Cell]],
@@ -550,7 +609,10 @@ def _drop_cells(spec: Pb1TabSpec, rows: dict[int, dict[str, Pb1Cell]], head_end:
         elif spec.section_rows_empty:
             description = cells.get(DESCRIPTION_COLUMN)
             section = description is not None and description.bold and str(description.value or "").strip()
-            gone = [k for k in cells if k not in keep and (r, k) not in spec.section_hidden] if section else []
+            gone = [
+                k for k in cells
+                if k not in keep and (r, k) not in spec.section_hidden and (r, k) not in spec.section_shown
+            ] if section else []
             if section:
                 for key in cells:
                     if (r, key) in spec.section_hidden:
@@ -565,6 +627,21 @@ def _drop_cells(spec: Pb1TabSpec, rows: dict[int, dict[str, Pb1Cell]], head_end:
         if r <= head_end:
             dropped.update((r, k) for k in spec.head_dropped_columns)
     return frozenset(dropped)
+
+
+def _removed_rows(sheet: SheetCells, spec: Pb1TabSpec, indexes: list[int]) -> frozenset[int]:
+    """The rows that are not part of the form (spec.dropped_rows; Excel rows). A row that still
+    has a description (the workbook) must start with the expected text, else it is kept (WARNING);
+    in the stored snapshot the row is already empty."""
+    removed: set[int] = set()
+    column = indexes[list(spec.columns).index(DESCRIPTION_COLUMN)]
+    for r, label in spec.dropped_rows:
+        description = _cell_value(sheet, r - 1, column)
+        if description is not None and not _label_key(description).startswith(_label_key(label)):
+            logger.warning("%s: row %d is not '%s'; not removed", sheet.name, r, label)
+            continue
+        removed.add(r)
+    return frozenset(removed)
 
 
 def match_tab_sheets(workbook: str, sheets: list[SheetCells]) -> dict[str, SheetCells]:

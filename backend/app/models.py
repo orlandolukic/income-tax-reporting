@@ -176,6 +176,7 @@ class CompanyYear(Base):
         UniqueConstraint("year", "company_id"),
         # Status columns are never empty and hold only 0 or 1 (user's rule, 2026-11-14).
         *(CheckConstraint(f"{field} IN (0, 1)", name=f"{field}_0_or_1") for field in NUMERIC_FIELDS),
+        CheckConstraint("form_type IN ('pdp', 'ppdg')", name="form_type"),
     )
 
     id: Mapped[int] = mapped_column(BigId, primary_key=True)
@@ -197,6 +198,10 @@ class CompanyYear(Base):
     # Shown in the year's table. A constructed year's company that is deselected (Migracija)
     # is hidden, not deleted, so its values are back when it is selected again.
     active: Mapped[bool] = mapped_column(Boolean, default=True, server_default=true())
+    # The company's type, which PB-1 form it files (user, 2026-11-25): "pdp" (the tax balance of
+    # legal entities, the form of the PB-1 workbook; every company until then) or "ppdg"
+    # (PPDG-1S, the tax balance of self-employed persons, Obrazac PB2; app/pb1_ppdg.py).
+    form_type: Mapped[str] = mapped_column(String(10), default="pdp", server_default="pdp")
 
     company: Mapped[Company] = relationship()
     referent: Mapped[Referent | None] = relationship()

@@ -243,7 +243,7 @@ function CellEditor({
       autoFocus
       inputMode={kind === "number" || rule === "pib" ? "numeric" : "text"}
       maxLength={kind === "number" ? 1 : rule === "pib" ? PIB_MAX_LENGTH : undefined}
-      aria-label="Cell value"
+      aria-label="Vrednost ćelije"
       aria-invalid={invalid || undefined}
       title={invalid ? TEXT_RULE_MESSAGES[kind === "number" ? "number" : (rule ?? "upper")] : undefined}
       value={text}
@@ -282,6 +282,7 @@ function DataCell({
   href,
   subText,
   numeric = false,
+  rightAligned = false,
   zeroFill = false,
   statusColors = false,
   shadeFormula = false,
@@ -299,6 +300,7 @@ function DataCell({
   href?: string;
   subText?: string; // second line in parentheses, e.g. the PIB below the company name
   numeric?: boolean; // numeric column: right-aligned
+  rightAligned?: boolean; // a text column aligned like the columns right of it (Tip, user 2026-11-25)
   zeroFill?: boolean; // empty cells are displayed as 0 (display only)
   // Home status columns (Preliminarni … PB-1,PB-2 za rad, values 0 / 1): 1 green, 0 red.
   statusColors?: boolean;
@@ -368,6 +370,7 @@ function DataCell({
         COLUMN_BORDER,
         (shadeAll || (shadeFormula && cell.formula)) && "bg-muted/60",
         isNumber && "text-end tabular-nums",
+        rightAligned && "text-end",
         red && "text-destructive hover:text-destructive",
         green && "text-success hover:text-success",
         // Clickable (opens the editor): pointing hand, as everything clickable in the app.
@@ -451,7 +454,10 @@ type ColumnPlan = {
 
 // Registry column widths (percent of the table). The numeric columns share what is left.
 const NUMBER_COLUMN_WIDTH = 3;
-const REGISTRY_WIDTHS = { name: 22, pib: 9, referent: 11, office: 8 };
+const REGISTRY_WIDTHS = { name: 20, pib: 9, referent: 11, office: 8, type: 7 };
+// The company type (PDP / PPDG-1S, user 2026-11-25): a column the API adds after the office
+// column (not a workbook column); read-only, right-aligned and shaded on Edit Company Data and Home.
+const TYPE_COLUMN = "TIP";
 
 /** Columns up to and including "PB-1,PB-2 za rad"; the unnamed column after it (N) is dropped. */
 function withoutColumnAfterLast(columns: CompanyColumn[]): CompanyColumn[] {
@@ -479,6 +485,7 @@ function planColumns(columns: CompanyColumn[], variant: TableVariant): ColumnPla
     if (pib) fixed[pib] = REGISTRY_WIDTHS.pib;
     if (referent >= 0) fixed[visible[referent].key] = REGISTRY_WIDTHS.referent;
     if (referent >= 0 && visible[referent + 1]) fixed[visible[referent + 1].key] = REGISTRY_WIDTHS.office;
+    if (visible.some((c) => c.key === TYPE_COLUMN)) fixed[TYPE_COLUMN] = REGISTRY_WIDTHS.type;
     const rest = visible.filter((c) => fixed[c.key] === undefined).length;
     const used = NUMBER_COLUMN_WIDTH + Object.values(fixed).reduce((a, b) => a + b, 0);
     const share = rest ? (100 - used) / rest : 0;
@@ -498,6 +505,7 @@ function planColumns(columns: CompanyColumn[], variant: TableVariant): ColumnPla
   // The PIB column is hidden only when it can be shown below the names.
   const hidden = new Set([...HIDDEN_HEADERS].filter((h) => h !== PIB_HEADER || name));
   // Hide the column right after "PB-1,PB-2 za rad" (column N), if there is one.
+  // The company type is shown on Home too, after the office column (user, 2026-11-25).
   const visible = withoutColumnAfterLast(columns.filter((c) => !hidden.has(normalizeHeader(c.header))));
   const numeric = keysFrom(visible, FIRST_NUMERIC_HEADER);
   return {
@@ -546,10 +554,12 @@ const DataRow = memo(function DataRow({
             onCommit={(value) => onCommit(row.row, column.key, value)}
             subText={home && isNameColumn && pibColumn ? pibText(row.cells[pibColumn]) : undefined}
             numeric={plan.numericColumns.has(column.key)}
+            rightAligned={column.key === TYPE_COLUMN}
             zeroFill={plan.zeroFillColumns.has(column.key)}
             statusColors={home && plan.numericColumns.has(column.key)}
             shadeFormula={home}
-            shadeAll={home || plan.numericColumns.has(column.key)}
+            // The company type is read-only too (user, 2026-11-25): shaded like the status columns.
+            shadeAll={home || plan.numericColumns.has(column.key) || column.key === TYPE_COLUMN}
             viewOnly={home}
             emptyPlaceholder={plan.placeholderColumns.has(column.key) ? EMPTY_TEXT_PLACEHOLDER : undefined}
             allowText={!home}
@@ -576,6 +586,7 @@ export function CompanyTable({
   year,
   variant = "home",
   query = "",
+  typeFilter = null,
   onShown,
 }: {
   data: CompanyTableData;
@@ -584,6 +595,8 @@ export function CompanyTable({
   variant?: TableVariant;
   // Search (header field): only the companies whose name, PIB, referent or office contain it.
   query?: string;
+  // Home (user, 2026-11-25): only the companies of this type ("PDP" / "PPDG-1S"); null: all.
+  typeFilter?: string | null;
   onShown?: (count: number) => void; // how many companies the search shows
 }) {
   // The API returns only the company list (165 rows for 2025), in order.
@@ -596,8 +609,9 @@ export function CompanyTable({
     () =>
       rows
         .map((row, index) => ({ row, number: index + 1 }))
-        .filter(({ row }) => !wanted || matches(wanted, Object.values(row.cells).filter((c) => c.text).map((c) => c.value))),
-    [rows, wanted],
+        .filter(({ row }) => !wanted || matches(wanted, Object.values(row.cells).filter((c) => c.text).map((c) => c.value)))
+        .filter(({ row }) => !typeFilter || row.cells[TYPE_COLUMN]?.value === typeFilter),
+    [rows, wanted, typeFilter],
   );
   useEffect(() => onShown?.(listed.length), [listed.length, onShown]);
 
@@ -609,7 +623,12 @@ export function CompanyTable({
         // Home: the statistics cards float at the top (sticky, about 8rem, under the 4rem page
         // header). Scrolling the page moves the title away and the table fills the screen below
         // the cards (4rem header + 8rem cards + bottom padding).
-        registry ? "max-h-[calc(100svh-12rem)] overflow-x-hidden overflow-y-auto" : "max-h-[calc(100svh-14rem)] overflow-auto",
+        // Registry (user, 2026-11-25): the table starts 204 px from the top; scrolling the page takes
+        // the heading away and the table grows to the window below the page header (4rem + 2rem).
+        // Home (2026-11-25): as tall as the window below the stuck statistics strip (4rem header +
+        // strip + bottom padding), so once the heading is scrolled away the table fills the window;
+        // at the top it starts 204 px down and is never shorter than there.
+        registry ? "max-h-[calc(100svh-6rem)] overflow-x-hidden overflow-y-auto" : "max-h-[calc(100svh-8.25rem)] overflow-auto",
       )}
     >
       <table className={cn("w-full caption-bottom text-sm", registry && "table-fixed")}>
@@ -637,7 +656,7 @@ export function CompanyTable({
                   "h-auto px-1.5 py-1.5 align-bottom leading-tight whitespace-pre-wrap",
                   registry && "break-words",
                   // Numeric columns: header aligned with the right-aligned amounts.
-                  plan.numericColumns.has(column.key) && "text-end",
+                  (plan.numericColumns.has(column.key) || column.key === TYPE_COLUMN) && "text-end",
                   COLUMN_BORDER,
                 )}
               >
@@ -647,7 +666,7 @@ export function CompanyTable({
               </TableHead>
             ))}
             {!registry && (
-              <TableHead className="h-auto px-1.5 py-1.5 align-bottom leading-tight">Actions</TableHead>
+              <TableHead className="h-auto px-1.5 py-1.5 align-bottom leading-tight">Akcije</TableHead>
             )}
           </TableRow>
         </TableHeader>
@@ -655,7 +674,7 @@ export function CompanyTable({
           {listed.map(({ row, number }) => (
             <DataRow key={row.row} row={row} number={number} plan={plan} onCommit={onCommit} year={year} />
           ))}
-          {wanted && listed.length === 0 && (
+          {(wanted || typeFilter) && listed.length === 0 && (
             <TableRow className="hover:bg-transparent">
               <TableCell colSpan={plan.visibleColumns.length + 2} className="text-muted-foreground py-6 text-center">
                 Nijedna firma ne odgovara pretrazi.

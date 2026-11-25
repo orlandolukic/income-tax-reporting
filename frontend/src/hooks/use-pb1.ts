@@ -17,7 +17,10 @@ export type Pb1Cell = {
   number?: boolean; // edited as a number (amounts, numeric template fields); else as text
   edited?: boolean; // changed in the app (amount: for this company; template: for all companies)
   fill?: string; // fill color from the sheet ("#rrggbb"; Poreski bilans head rows only)
+  tone?: "expense" | "income" | "balance"; // Klasa 5 red, Klasa 6 green; balance: > 0 green, < 0 red
   formula?: boolean; // computed with the workbook's formula from the current values (read-only)
+  minus?: boolean; // Prekoracenje of a line with "-" in the line 59 formula: an overrun is green
+  subtotal?: boolean; // signed subtotal of a section's overruns: > 0 red, < 0 green; soft brand background
 };
 export type Pb1Column = {
   key: string;
@@ -35,6 +38,7 @@ export type Pb1Row = {
   cells: Record<string, Pb1Cell>;
   shaded?: boolean; // section row (bold description): grey background
 };
+export type Pb1HeadFigure = { label: string; row: number; column: string };
 export type Pb1Data = {
   company: { row: number; name: string; pib: string | null };
   workbook: string;
@@ -48,6 +52,7 @@ export type Pb1Data = {
   summary?: Pb1Row[]; // closing rows (Poreski bilans), shown as a separate table below the form
   head?: Pb1Row[]; // the sheet's first rows (Poreski bilans), shown as a separate table above the form
   head_columns?: Pb1Column[]; // the head table's columns, one to one with `columns`
+  head_figures?: Pb1HeadFigure[]; // the head as labelled values (Klasa 5, Klasa 6, Saldo, Meseci poslovanja)
   // Column of the comments (in the rows' cells, not in `columns`): shown beside the table as
   // description-comment pairs; global (the same for every year and company), shown only on Global Settings.
   comment_column?: string;
@@ -110,6 +115,8 @@ export function usePb1(
   // undefined: the server's choice (final once the preliminary report is done)
   report: Pb1Report | undefined,
   onUnauthorized: () => void,
+  // false: nothing is loaded (the Poreski bilans strip on that tab itself uses the page's data).
+  enabled = true,
 ) {
   const autosave = useAutosave();
   const [data, setData] = useState<Pb1Data | null>(null);
@@ -120,6 +127,7 @@ export function usePb1(
   pendingRef.current = autosave.pendingPb1;
 
   useEffect(() => {
+    if (!enabled) return;
     const controller = new AbortController();
     setLoading(true);
     setError(null);
@@ -151,7 +159,7 @@ export function usePb1(
       });
     return () => controller.abort();
     // onUnauthorized is intentionally not a dependency: it must not trigger a reload.
-  }, [year, row, tab, report, reloadKey]);
+  }, [year, row, tab, report, reloadKey, enabled]);
 
   // Save results for this form: mark the field as edited or not (the server decides), and show
   // the tab's recomputed formula cells.

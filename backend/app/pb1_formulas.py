@@ -68,7 +68,7 @@ FORMULAS: dict[str, dict[str, str]] = {
         "I32": '=D28-D29',
         "C33": '=D3*F33',
         "C70": '=+C67',
-        "C74": '=C5+C7+D12+D14+D15+D16+D17+D18+D19+D20+D21+D22+D23+D24+D25-D29+IF(E30>0,E30,0)+IF(E31>0,E31,0)+IF(E32>0,E32,0)+IF(E33>0,E33,0)+D34+D36+D37+D39+D40+D41+D43+D47+D48+D49+D50+D51+D52+D53+D54+C70+C72-D11-D15-D22-D26-D27+D28-D35-D38-D42-D44-D45-D55-D56-D57-D58-D59-D60',
+        "C74": '=C5+C7+D12+D14+D15+D16+D17+D18+D19+D20+D21+D22+D23+D24+D25-D29+IF(E30>0,E30,0)+IF(E31>0,E31,0)+IF(E32>0,E32,0)+IF(E33>0,E33,0)+D34+D36+D37+D39+D40+D43+D47+D48+D49+D50+D51+D52+D53+D54+C70+C72-D11-D15-D22-D26-D27+D28-D35-D38-D42-D44-D45-D55-D56-D57-D58-D59-D60',
         "C77": '=+C74-C76',
         "C86": '=C77+C80',
         "J86": '=+C86/I86*100',
@@ -176,24 +176,75 @@ FORMULAS: dict[str, dict[str, str]] = {
 # Formulas the app adds where the workbook has none (its cells blank): not compared with the
 # file's stored results by verify_formulas (there is no result to compare with).
 # Poreski bilans: Prekoracenje (E) = Ostvareni troskovi (D) - Priznati troskovi (C) in every form
-# line (user, 2026-11-17), negative too; only a positive overrun counts in Oporeziva dobit (C74)
-# and in Preliminarni rezultat (G3).
-# Not the total lines 57 (row 70), 59 Oporeziva dobit (74) and 62 Ostatak oporezive dobiti (77):
-# their Prekoracenje is empty (user, 2026-11-17: they are totals, not items).
+# line (user, 2026-11-17), never negative: Ostvareni below Priznati (or 0) gives 0 (user,
+# 2026-11-22). Only a positive overrun counts in Oporeziva dobit (C74) and in Preliminarni
+# rezultat (G3).
+# Not row 41 (removed from the form, user 2026-11-22: not in the official form; also left out of
+# C74), nor the lines 59 Dobit (row 74) and 62 Ostatak dobiti (77): their Prekoracenje is empty
+# (user, 2026-11-17: they are totals, not items). Line 57 (row 70) has one again (user,
+# 2026-11-25: it is in the line 59 formula, so its overrun is part of the tax base).
 OVERRUN_ROWS = (
     7, 8, 9, 11, 12, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32, 33, 34,
-    35, 36, 37, 38, 39, 40, 41, 42, 43, 44, 45, 47, 48, 49, 50, 51, 52, 53, 54, 55, 56, 57, 58, 59, 60,
-    62, 63, 64, 65, 67, 68, 72, 75, 76, 79, 80, 81, 82, 83, 84,
-)
+    35, 36, 37, 38, 39, 40, 42, 43, 44, 45, 47, 48, 49, 50, 51, 52, 53, 54, 55, 56, 57, 58, 59, 60,
+    62, 63, 64, 65, 67, 68, 70, 72, 76, 79, 80, 81, 82, 83, 84,
+)  # not 75 (line 60 Gubitak: its Prekoracenje is the loss sum, below)
 for _row in OVERRUN_ROWS:
-    FORMULAS["poreski-bilans"][f"E{_row}"] = f"=D{_row}-C{_row}"
-# Poreska osnovica = the sum of the positive overruns of every line (user, 2026-11-17; was
-# C77 + C80); Porez 15% and Mesecna akontacija follow it as before.
-FORMULAS["poreski-bilans"]["C86"] = "=" + "+".join(f"IF(E{r}>0,E{r},0)" for r in OVERRUN_ROWS)
+    FORMULAS["poreski-bilans"][f"E{_row}"] = f"=IF(D{_row}-C{_row}>0,D{_row}-C{_row},0)"
+# Line 62 Ostatak dobiti (row 77) has no overrun; its Prekoracenje shows a fixed 0,00 so the
+# column looks the same in every line (user, 2026-11-25; read-only). Line 59 (row 74): see below.
+ZERO_OVERRUN_ROWS = (77,)
+for _row in ZERO_OVERRUN_ROWS:
+    FORMULAS["poreski-bilans"][f"E{_row}"] = "=0"
+# The tax base follows the formula of line 59 Dobit (user, 2026-11-25), applied to the overruns:
+#   1-2-4+5 do 17-18-19+20-21+22 do 26-27+28+29-30+31+32-33+34-35-36+37 do 44-45 do 50+57+58
+# Its lines (rows: 7-60 without the section headings, the removed row 41 and line 3 (row 9),
+# which is in the formula of line 60 Gubitak, not 59; plus 57 = row 70 and 58 = row 72) form the
+# base; the overruns of the other lines (3, 51-56, 60-68) are shown but count nowhere for now
+# (user: to be decided later).
+BASE_OVERRUN_ROWS = tuple(r for r in OVERRUN_ROWS if 7 <= r <= 60 and r != 9) + (70, 72)
+# The lines with "-" in that formula: 2, 4, 18, 19, 21, 27, 30, 33, 35, 36, 45-50 (rows from
+# app/pb1_official.py). Their overrun is subtracted from the base and shown green; every other
+# overrun is added and shown red (as before).
+MINUS_OVERRUN_ROWS = frozenset({8, 11, 26, 27, 29, 35, 38, 42, 44, 45, 55, 56, 57, 58, 59, 60})
+# Poreska osnovica = the signed sum of those overruns (each 0 or positive); a negative result is
+# a tax loss (tax and monthly advance 0, LOSS_RULES). Was the plain sum over every line
+# (2026-11-17), before that C77 + C80. Porez 15% and Mesecna akontacija follow it as before.
+FORMULAS["poreski-bilans"]["C86"] = "=" + "".join(
+    f"{'-' if r in MINUS_OVERRUN_ROWS else '+'}E{r}" for r in BASE_OVERRUN_ROWS
+)
+# The same signed sum is shown where it belongs, in line 59 Dobit, column Prekoracenje (user,
+# 2026-11-25; read-only, may be negative). Its Priznati iznosi (C74) keeps the workbook formula
+# for now (user asks about its value).
+FORMULAS["poreski-bilans"]["E74"] = FORMULAS["poreski-bilans"]["C86"]
+# Line 60 Gubitak, column Prekoracenje (row 75; user, 2026-11-25): the formula of line 60 applied
+# to the overruns, i.e. line 3 (row 9) plus the lines of line 59 except line 1 with every sign
+# inverted: 3+2+4-5 do 17+18+19-20+21-22 do 26+27-28-29+30-31-32+33-34+35+36-37 do 44+45 do 50-57-58.
+# Read-only, may be negative; its own overrun (D75 - C75) is not computed any more.
+LOSS_OVERRUN_ROWS = (9,) + tuple(r for r in BASE_OVERRUN_ROWS if r != 7)
+# Overruns shown green: the "-" lines of line 59, and line 3 (not in line 59; "+" in the line 60
+# Gubitak formula, i.e. on the loss side; user, 2026-11-25). Every other overrun is red.
+GREEN_OVERRUN_ROWS = MINUS_OVERRUN_ROWS | {9}
+FORMULAS["poreski-bilans"]["E75"] = "=" + "".join(
+    f"{'+' if r == 9 or r in MINUS_OVERRUN_ROWS else '-'}E{r}" for r in LOSS_OVERRUN_ROWS
+)
+# Subtotals (user, 2026-11-25): every section heading with a Roman numeral (the shaded rows I-IX)
+# that has at least one line of the line 59 formula shows, in its Prekoracenje, the signed sum of
+# those lines' overruns ("-" lines subtract). Rows of the headings, in order, with the row that
+# ends the last section (78: B. Kapitalni dobici i gubici).
+_ROMAN_HEADINGS = (6, 10, 13, 46, 61, 66, 69, 71, 73, 78)
+SECTION_SUBTOTALS: dict[int, tuple[int, ...]] = {
+    heading: lines
+    for heading, end in zip(_ROMAN_HEADINGS, _ROMAN_HEADINGS[1:])
+    if (lines := tuple(r for r in BASE_OVERRUN_ROWS if heading < r < end))
+}
+for _heading, _lines in SECTION_SUBTOTALS.items():
+    FORMULAS["poreski-bilans"][f"E{_heading}"] = "=" + "".join(
+        f"{'-' if r in MINUS_OVERRUN_ROWS else '+'}E{r}" for r in _lines
+    )
 
 ADDED_FORMULAS: dict[str, frozenset[str]] = {
     "uporedo": frozenset({"E10", "E11", "E14", "E17", "E18", "E21", "E22", "E25"}),
-    "poreski-bilans": frozenset({*(f"E{r}" for r in OVERRUN_ROWS), "C86"}),
+    "poreski-bilans": frozenset({*(f"E{r}" for r in (*OVERRUN_ROWS, *ZERO_OVERRUN_ROWS, *SECTION_SUBTOTALS)), "C86", "E74", "E75"}),
 }
 
 

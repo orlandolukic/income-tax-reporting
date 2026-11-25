@@ -12,14 +12,14 @@ const logger = getLogger("pb1History");
 type ReportEvent = { event: string; at: string; by: string };
 
 const EVENTS: Record<string, { label: string; icon: typeof History; tone: string }> = {
-  preliminary_done: { label: "Preliminary report marked as done", icon: CheckCheck, tone: "text-chart-3 bg-chart-3/10 border-chart-3/40" },
-  gfi_done: { label: "GFI marked as done", icon: CheckCheck, tone: "text-chart-3 bg-chart-3/10 border-chart-3/40" },
-  gfi_reopened: { label: "GFI reopened", icon: Undo2, tone: "text-chart-1 bg-chart-1/10 border-chart-1/40" },
-  final_created: { label: "Final report created from preliminary", icon: CopyPlus, tone: "text-muted-foreground bg-muted border-border" },
-  final_done: { label: "Final report marked as done", icon: CheckCheck, tone: "text-chart-3 bg-chart-3/10 border-chart-3/40" },
-  final_unlocked: { label: "Final report unlocked", icon: LockOpen, tone: "text-chart-1 bg-chart-1/10 border-chart-1/40" },
-  submitted: { label: "Report submitted", icon: Send, tone: "text-success bg-success/10 border-success/40" },
-  submission_withdrawn: { label: "Submission withdrawn", icon: Undo2, tone: "text-destructive bg-destructive/10 border-destructive/40" },
+  preliminary_done: { label: "Preliminarni izveštaj označen kao gotov", icon: CheckCheck, tone: "text-chart-3 bg-chart-3/10 border-chart-3/40" },
+  gfi_done: { label: "GFI označen kao gotov", icon: CheckCheck, tone: "text-chart-3 bg-chart-3/10 border-chart-3/40" },
+  gfi_reopened: { label: "GFI ponovo otvoren", icon: Undo2, tone: "text-chart-1 bg-chart-1/10 border-chart-1/40" },
+  final_created: { label: "Konačni izveštaj napravljen iz preliminarnog", icon: CopyPlus, tone: "text-muted-foreground bg-muted border-border" },
+  final_done: { label: "Konačni izveštaj označen kao gotov", icon: CheckCheck, tone: "text-chart-3 bg-chart-3/10 border-chart-3/40" },
+  final_unlocked: { label: "Konačni izveštaj otključan", icon: LockOpen, tone: "text-chart-1 bg-chart-1/10 border-chart-1/40" },
+  submitted: { label: "Izveštaj predat", icon: Send, tone: "text-success bg-success/10 border-success/40" },
+  submission_withdrawn: { label: "Predaja povučena", icon: Undo2, tone: "text-destructive bg-destructive/10 border-destructive/40" },
 };
 
 const pad = (n: number) => String(n).padStart(2, "0");
@@ -62,11 +62,11 @@ export function Pb1ReportHistory({ year, row, version }: { year: number; row: nu
     <Sheet open={open} onOpenChange={setOpen}>
       <Button variant="outline" size="sm" onClick={() => setOpen(true)}>
         <History />
-        History
+        Istorija
       </Button>
       <SheetContent className="w-full sm:max-w-md">
         <SheetHeader>
-          <SheetTitle>Report history</SheetTitle>
+          <SheetTitle>Istorija izveštaja</SheetTitle>
           <SheetDescription>Koraci preliminarnog i konačnog izveštaja, sa datumom, vremenom i korisnikom.</SheetDescription>
         </SheetHeader>
         <div className="overflow-y-auto px-4 pb-6">

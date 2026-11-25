@@ -45,7 +45,8 @@ from app.auth import require_user
 from app.gfi_store import Edits, GfiStore, get_gfi_store
 from app.gfi_table import SourceTable
 from app.logging_config import get_logger
-from app.pb1_formulas import FORMULAS, Calculator, result_value, split_address, unverified_formulas, verify_formulas
+from app.pb1_ppdg import PPDG, FormVariant, ppdg_variant, ppdg_workbook
+from app.pb1_formulas import FORMULAS, GREEN_OVERRUN_ROWS, SECTION_SUBTOTALS, Calculator, result_value, split_address, unverified_formulas, verify_formulas
 from app.pb1_pdf import build_pb1_pdf
 from app.pb1_workbook import (
     DEFAULT_TAB,
@@ -93,9 +94,17 @@ class Pb1CellOut(BaseModel):
     number: bool = False  # edited as a number (amounts, numeric template fields); else as text
     edited: bool = False  # changed in the app (amount: for this company; template: for all companies)
     fill: str | None = None  # fill color from the sheet ("#rrggbb"; head rows only)
+    # Text colour: "expense" red, "income" green (Klasa 5 / Klasa 6), "balance" by its sign
+    # (Saldo Klasa 6 - 5: above 0 green, below 0 red with the minus).
+    tone: str | None = None
     formula: bool = False  # computed with the workbook's formula (read-only)
     red: bool = False  # shown red although positive (an overrun in Prekoracenje)
-    green: bool = False  # shown green although negative (under the limit in Prekoracenje)
+    # Prekoracenje of a line with "-" in the line 59 formula: an overrun shown green, not red.
+    minus: bool = False
+    # Signed subtotal of a section's overruns (Prekoracenje of a Roman-numeral heading): > 0 red,
+    # < 0 green with its minus; bold on a soft background of its own (user, 2026-11-25).
+    subtotal: bool = False
+    green: bool = False  # shown green (such an overrun > 0, a negative subtotal; for the PDF)
 
 
 class Pb1RowOut(BaseModel):
@@ -108,6 +117,12 @@ class Pb1RowOut(BaseModel):
 class Pb1Tab(BaseModel):
     key: str  # "poreski-bilans" | "uporedo" | "preliminarni"
     title: str  # Excel sheet name
+
+
+class Pb1HeadFigure(BaseModel):
+    label: str
+    row: int  # the value's cell in `head` (row, column)
+    column: str
 
 
 class Pb1Table(BaseModel):
@@ -127,6 +142,9 @@ class Pb1Table(BaseModel):
     # separate table above the form, with the same columns.
     head: list[Pb1RowOut] = []
     head_columns: list[Pb1Column] = []  # the head table's columns, one to one with `columns`
+    # The head as labelled values (user, 2026-11-25: one 2 x 4 table, labels over values, no
+    # company name, no sheet colours): Klasa 5, Klasa 6, Saldo (Klasa 6 - 5), Meseci poslovanja.
+    head_figures: list[Pb1HeadFigure] = []
     # Column of the comments (in the rows' cells, not in `columns`): shown beside the table as
     # description-comment pairs, one per row, each company its own.
     comment_column: str | None = None
@@ -394,6 +412,9 @@ def load_pb1_form(
         logger.warning("No PB-1 form for reporting year %s", year)
         raise Pb1EditError(status.HTTP_404_NOT_FOUND, f"Za godinu {year} nema PB-1 obrasca.")
     pb1, template_year = template
+    # The company's type picks the form: PPDG-1S companies file PB2 (app/pb1_ppdg.py).
+    if store.form_type(year, (source.workbook, row)) == PPDG:
+        pb1 = ppdg_workbook(pb1)
 
     sheet = pb1.sheets.get(tab)
     if sheet is None:
@@ -406,7 +427,8 @@ def load_pb1_form(
         report = FINAL if state.preliminary_done else PRELIMINARY
     # The final report holds only its own copy (pb1_company_edit), never the file's amounts.
     has_values = (
-        report == PRELIMINARY and template_year == year and pb1_owner_row(gfi, year, source, pb1, user) == row
+        report == PRELIMINARY and template_year == year and pb1.variant != PPDG
+        and pb1_owner_row(gfi, year, source, pb1, user) == row
     )
     return Pb1Form(
         year=year, tab=tab, company=company, company_key=company_key,
@@ -444,7 +466,8 @@ def computed_cells(pb1: Pb1Workbook) -> dict[str, set[tuple[int, str]]]:
     if cached is not None and cached[0] is pb1:
         return cached[1]
     cells: dict[str, set[tuple[int, str]]] = {}
-    for tab, formulas in FORMULAS.items():
+    variant = variant_of(pb1)
+    for tab, formulas in variant.formulas.items():
         sheet = pb1.sheets.get(tab)
         if sheet is None:
             continue
@@ -454,10 +477,11 @@ def computed_cells(pb1: Pb1Workbook) -> dict[str, set[tuple[int, str]]]:
             if cell is not None and cell.amount and column in sheet.spec.columns:
                 cells.setdefault(tab, set()).add((row, column))
     unverified = unverified_formulas()
+    # The PPDG-1S form has no workbook: nothing to check its formulas against.
     mismatches = verify_formulas(
         pb1.raw,
         {tab: set(FORMULAS[tab]) - unverified.get(tab, set()) for tab in pb1.sheets if tab in FORMULAS},
-    )
+    ) if variant.verified else []
     if mismatches:
         logger.error(
             "PB-1 formulas don't match %s (%d differences, e.g. %s); computed cells are off for this workbook",
@@ -515,6 +539,17 @@ LOSS_RULES: dict[tuple[str, str], tuple[str, str]] = {
 }
 LOSS_BANNER_BASE = ("poreski-bilans", "C86")
 
+# The two forms (company_year.form_type): PDP, the workbook's, and PPDG-1S (app/pb1_ppdg.py).
+PDP_VARIANT = FormVariant(
+    key="pdp", formulas=FORMULAS, loss_rules=LOSS_RULES, base=LOSS_BANNER_BASE,
+    green_rows=frozenset(GREEN_OVERRUN_ROWS), subtotal_rows=frozenset(SECTION_SUBTOTALS), verified=True,
+)
+PPDG_VARIANT = ppdg_variant(LOSS_RULES)
+
+
+def variant_of(pb1: Pb1Workbook) -> FormVariant:
+    return PPDG_VARIANT if pb1.variant == PPDG else PDP_VARIANT
+
 
 def _negative(value: object) -> bool:
     return isinstance(value, float) and value < 0
@@ -522,12 +557,12 @@ def _negative(value: object) -> bool:
 
 def _loss_zeroed(calc: Calculator, tab: str, address: str) -> bool:
     """Whether a tax cell is 0 because its tax base is negative (a tax loss)."""
-    base = LOSS_RULES.get((tab, address))
+    base = calc.variant.loss_rules.get((tab, address))
     return base is not None and _negative(calc.value(*base))
 
 
 def _loss(calc: Calculator) -> Pb1Loss | None:
-    base = calc.value(*LOSS_BANNER_BASE)
+    base = calc.value(*calc.variant.base)
     return Pb1Loss(base=base) if _negative(base) else None
 
 
@@ -547,7 +582,7 @@ def _results(calc: Calculator) -> Pb1Results:
 
     return Pb1Results(
         accounting=_result(number(*RESULT_CLASS_6) - number(*RESULT_CLASS_5)),
-        tax=_result(number(*LOSS_BANNER_BASE)),
+        tax=_result(number(*calc.variant.base)),
     )
 
 
@@ -558,7 +593,7 @@ def _calculator(form: Pb1Form, edits: dict[str, TabEdits]) -> Calculator:
     calc: Calculator
 
     def input_value(tab: str, address: str) -> CellValue:
-        if (tab, address) in LOSS_RULES and _loss_zeroed(calc, tab, address):
+        if (tab, address) in variant.loss_rules and _loss_zeroed(calc, tab, address):
             return 0.0
         column, row = split_address(address)
         sheet = form.pb1.sheets.get(tab)
@@ -568,7 +603,9 @@ def _calculator(form: Pb1Form, edits: dict[str, TabEdits]) -> Calculator:
             return None if cell.dropped else _cell_view(form, tab, row, column, cell, edits[tab])[0]
         return form.pb1.raw.get(tab, {}).get(address) if form.has_values else None
 
-    calc = Calculator(input_value)
+    variant = variant_of(form.pb1)
+    calc = Calculator(input_value, variant.formulas)
+    calc.variant = variant  # the form's loss rules and tax base (_loss_zeroed, _loss, _results)
     return calc
 
 
@@ -576,12 +613,18 @@ def _computed_values(form: Pb1Form, calc: Calculator) -> list[Pb1ComputedCell]:
     cells = set(computed_cells(form.pb1).get(form.tab, set()))
     cells |= {
         (split_address(a)[1], split_address(a)[0])
-        for (t, a) in LOSS_RULES if t == form.tab and _loss_zeroed(calc, t, a)
+        for (t, a) in calc.variant.loss_rules if t == form.tab and _loss_zeroed(calc, t, a)
     }
-    return [
+    computed = [
         Pb1ComputedCell(row=row, column=column, value=result_value(calc.value(form.tab, f"{column}{row}")))
         for row, column in sorted(cells)
     ]
+    if form.sheet.spec.head_result:
+        # The extra head row (Saldo Klasa 6 - 5) follows Klasa 5 / Klasa 6 at once.
+        computed.append(Pb1ComputedCell(
+            row=form.sheet.head_end + 1, column=form.sheet.spec.head_result[3], value=_head_result_value(form, calc),
+        ))
+    return computed
 
 
 def build_pb1_table(form: Pb1Form) -> Pb1Table:
@@ -609,23 +652,31 @@ def build_pb1_table(form: Pb1Form) -> Pb1Table:
                 is_comment = key == comment_column and row_number > sheet.head_end
                 if kind is None and not is_comment and (row_number, key) != sheet.spec.company_name_cell:
                     value = shift_years(value, delta)
+            is_overrun = key == sheet.spec.overrun_column and row_number > sheet.head_end
+            minus = is_overrun and form.tab == "poreski-bilans" and row_number in calc.variant.green_rows
+            positive = is_overrun and _is_number(value) and float(value) > 0
+            subtotal = is_overrun and form.tab == "poreski-bilans" and row_number in calc.variant.subtotal_rows
             out[key] = Pb1CellOut(
                 value=value,
                 format=_shown_format(cell),
                 # Numbers in normal weight where the tab says so (Poreski bilans); texts keep bold.
-                bold=cell.bold
-                and not (sheet.spec.plain_numbers and (cell.amount or _is_number(value)))
-                and (row_number, key) not in sheet.spec.plain_cells,
+                # A section subtotal is bold, to stand apart from the lines (user, 2026-11-25).
+                bold=subtotal or (
+                    cell.bold
+                    and not (sheet.spec.plain_numbers and (cell.amount or _is_number(value)))
+                    and (row_number, key) not in sheet.spec.plain_cells
+                ),
                 amount=cell.amount,
                 editable=kind is not None and not form.locked,
                 number=kind in ("amount", "number", "months"),
                 edited=edit is not None,
                 fill=cell.fill,
+                tone=dict(sheet.spec.cell_tones).get((row_number, key)),
                 formula=formula,
-                red=key == sheet.spec.overrun_column and row_number > sheet.head_end
-                and _is_number(value) and float(value) > 0,
-                green=key == sheet.spec.overrun_column and row_number > sheet.head_end
-                and _is_number(value) and float(value) < 0,
+                red=positive and not minus,
+                minus=minus,
+                subtotal=subtotal,
+                green=(positive and minus) or (subtotal and _is_number(value) and float(value) < 0),
             )
         description = cells.get("B")
         shaded = row_number > sheet.head_end and bool(
@@ -656,6 +707,7 @@ def build_pb1_table(form: Pb1Form) -> Pb1Table:
         has_values=form.has_values,
         entered=len({k for k in company_edits if k[1] != comment_column} - computed),
         columns=columns, rows=rows, summary=summary, head=head, head_columns=head_columns,
+        head_figures=_head_figures(head, head_columns or columns, sheet.spec),
         comment_column=comment_column, loss=_loss(calc), results=_results(calc),
         report=form.report, preliminary_done=form.state.preliminary_done, gfi_done=form.state.gfi_done,
         final_created=form.state.final_created, final_done=form.state.final_done,
@@ -669,16 +721,51 @@ def _head_result_row(form: Pb1Form, calc: Calculator, head: list[Pb1RowOut]) -> 
     label, address, label_column, value_column, value_fill = form.sheet.spec.head_result
     labels, values = head[-2].cells, head[-1].cells
     value_cell = values.get(value_column) or Pb1CellOut()
+    value = _head_result_value(form, calc)
     return Pb1RowOut(
         row=form.sheet.head_end + 1,
         cells={
             label_column: Pb1CellOut(value=label, fill=(labels.get(label_column) or Pb1CellOut()).fill),
             value_column: Pb1CellOut(
-                value=result_value(calc.value(form.tab, address)), format=value_cell.format, amount=True,
-                formula=True, fill=value_fill,
+                value=value, format=value_cell.format, amount=True, formula=True, fill=value_fill,
+                # The balance (user, 2026-11-25): a profit green, a loss red with its minus.
+                tone="balance",
             ),
         },
     )
+
+
+def _head_figures(head: list[Pb1RowOut], columns: list[Pb1Column], spec) -> list[Pb1HeadFigure]:
+    """The head rows' labelled values: a text with an amount (or number) to its right or right
+    below it. The title and company name (the first two columns) are left out. Months in business
+    last (user, 2026-11-25: Klasa 5, Klasa 6, Saldo, Meseci poslovanja)."""
+    keys = [c.key for c in columns]
+    figures: list[Pb1HeadFigure] = []
+    for i, row in enumerate(head):
+        for j, key in enumerate(keys[2:], start=2):
+            cell = row.cells.get(key)
+            text = str(cell.value).strip() if cell is not None and isinstance(cell.value, str) else ""
+            if not text or cell.amount:
+                continue
+            candidates = [(row.row, keys[j + 1], row.cells.get(keys[j + 1]))] if j + 1 < len(keys) else []
+            if i + 1 < len(head):
+                candidates.append((head[i + 1].row, key, head[i + 1].cells.get(key)))
+            for value_row, value_key, value in candidates:
+                if value is not None and (value.amount or _is_number(value.value)):
+                    figures.append(Pb1HeadFigure(label=text, row=value_row, column=value_key))
+                    break
+    months = spec.months_cell
+    return sorted(figures, key=lambda f: months is not None and (f.row, f.column) == tuple(months))
+
+
+def _head_result_value(form: Pb1Form, calc: Calculator) -> CellValue:
+    """The value of the extra head row: a form address, or "A-B" (the difference of two)."""
+    address = form.sheet.spec.head_result[1]
+    if "-" in address:
+        left, right = (calc.value(form.tab, a.strip()) for a in address.split("-", 1))
+        num = lambda v: float(v) if isinstance(v, (int, float)) and not isinstance(v, bool) else 0.0  # noqa: E731
+        return round(num(left) - num(right), 2)
+    return result_value(calc.value(form.tab, address))
 
 
 def save_pb1_cell(
@@ -825,7 +912,7 @@ def get_pb1_pdf(
     except Exception:
         logger.exception("Failed to build the PB-1 PDF for row %d (%s)", row, year)
         raise HTTPException(status.HTTP_500_INTERNAL_SERVER_ERROR, "PDF nije mogao da se napravi.") from None
-    kind = "preliminary" if tables[0].report == PRELIMINARY else "final"
+    kind = "preliminarni" if tables[0].report == PRELIMINARY else "konačni"  # file name shown to the user
     name = re.sub(r'[\/:*?"<>|]+', " ", f"PB-1 {year} {company.name} {kind}").strip() + ".pdf"
     disposition = "inline" if inline else "attachment"
     logger.info("PB-1 PDF for '%s' (row %d, %s) by '%s': %d bytes", company.name, row, year, username, len(pdf))

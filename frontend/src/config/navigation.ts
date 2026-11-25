@@ -6,18 +6,18 @@ export type NavGroup = { title: string; items: NavItem[] };
 // Sidebar navigation. Add new pages here so they appear in the sidebar.
 export const navGroups: NavGroup[] = [
   {
-    title: "General",
-    items: [{ title: "Home", url: "/", icon: House }],
+    title: "Opšte",
+    items: [{ title: "Početna", url: "/", icon: House }],
   },
   {
-    title: "Companies",
-    items: [{ title: "Edit Company Data", url: "/edit-company-data", icon: SquarePen }],
+    title: "Firme",
+    items: [{ title: "Izmena podataka firmi", url: "/edit-company-data", icon: SquarePen }],
   },
   {
-    title: "Administration",
-    items: [{ title: "Migration", url: "/migration", icon: CalendarPlus }],
+    title: "Administracija",
+    items: [{ title: "Migracija", url: "/migration", icon: CalendarPlus }],
   },
 ];
 
 // Pinned to the bottom of the sidebar, right above the user menu (settings are always last).
-export const footerNavItems: NavItem[] = [{ title: "Global Settings", url: "/global-settings", icon: Settings }];
+export const footerNavItems: NavItem[] = [{ title: "Globalna podešavanja", url: "/global-settings", icon: Settings }];

@@ -55,7 +55,7 @@ export function NavUser() {
             <DropdownMenuSeparator />
             <DropdownMenuItem onClick={logout}>
               <LogOut />
-              Log out
+              Odjavi se
             </DropdownMenuItem>
           </DropdownMenuContent>
         </DropdownMenu>

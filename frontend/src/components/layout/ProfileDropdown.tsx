@@ -21,7 +21,7 @@ export function ProfileDropdown() {
   return (
     <DropdownMenu modal={false}>
       <DropdownMenuTrigger asChild>
-        <Button variant="ghost" className="relative size-8 rounded-full" aria-label="Account menu">
+        <Button variant="ghost" className="relative size-8 rounded-full" aria-label="Meni naloga">
           <UserAvatar username={name} className="rounded-full" />
         </Button>
       </DropdownMenuTrigger>
@@ -32,7 +32,7 @@ export function ProfileDropdown() {
         <DropdownMenuSeparator />
         <DropdownMenuItem onClick={logout}>
           <LogOut />
-          Log out
+          Odjavi se
         </DropdownMenuItem>
       </DropdownMenuContent>
     </DropdownMenu>

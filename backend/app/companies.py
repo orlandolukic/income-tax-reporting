@@ -9,7 +9,15 @@ from fastapi import APIRouter, Depends, HTTPException, status
 from pydantic import BaseModel
 
 from app.auth import require_user
+from sqlalchemy import select
+
+from app.db import session_scope
+from app.models import CompanyYear as CompanyYearRow
 from app.gfi_store import Edits, clean_text, edit_kind, get_gfi_store, status_value
+from app.migration import (
+    AddedCompany, CompanyRows, DeletedCompanies, MigrationError, NewCompany, YearCompany, add_company, delete_companies,
+    year_companies,
+)
 from app.models import FORMULA_FIELDS, KOM
 from app.gfi_table import CellValue, SourceTable
 from app.logging_config import get_logger
@@ -159,11 +167,30 @@ def build_company_table(source: SourceTable, edits: Edits) -> CompanyTable:
     )
 
 
+# The company type column (user, 2026-11-25): shown on Edit Company Data, read-only, after the
+# office column; not a workbook column (key "TIP"), so Home leaves it out.
+TYPE_COLUMN = "TIP"
+TYPE_LABELS = {"pdp": "PDP", "ppdg": "PPDG-1S"}
+
+
+def _with_types(table: CompanyTable, year: int) -> CompanyTable:
+    with session_scope() as session:
+        types = dict(session.execute(
+            select(CompanyYearRow.source_row, CompanyYearRow.form_type).where(CompanyYearRow.year == year)
+        ).all())
+    headers = [(c.header or "").strip().upper() for c in table.columns]
+    position = headers.index("REFERENT") + 2 if "REFERENT" in headers else len(table.columns)
+    table.columns.insert(position, Column(key=TYPE_COLUMN, header="Tip"))
+    for row in table.rows:
+        row.cells[TYPE_COLUMN] = Cell(value=TYPE_LABELS.get(types.get(row.row, "pdp"), "PDP"))
+    return table
+
+
 @router.get("/companies", response_model_exclude_defaults=True)
 def get_companies(year: int, username: str = Depends(require_user)) -> CompanyTable:
     store = get_gfi_store()
     source, edits = store.load(year)
-    table = build_company_table(source, edits)
+    table = _with_types(build_company_table(source, edits), year)
     logger.info(
         "Loaded %d company rows for %s from %s (%s, %d edits)",
         len(table.rows), year, source.workbook, store.name, len(edits),
@@ -205,3 +232,34 @@ def update_cell(
     return CellUpdateResult(
         row=row, column=column, value=value, edited=edited, formulas=formulas, stats=table.stats
     )
+
+
+@router.post("/companies")
+def add_company_route(year: int, details: NewCompany, username: str = Depends(require_user)) -> AddedCompany:
+    """Adds a new company at the end of the year's table (Edit Company Data, user 2026-11-25)."""
+    try:
+        with session_scope() as session:
+            return add_company(session, year, details, username)
+    except MigrationError as exc:
+        if exc.status_code < 500:
+            logger.warning("Adding a company to %s refused: %s", year, exc)
+        raise HTTPException(exc.status_code, str(exc)) from None
+
+
+@router.get("/companies/registry")
+def get_year_companies_route(year: int, username: str = Depends(require_user)) -> list[YearCompany]:
+    """The year's companies with whether each can be deleted (Edit Company Data, "Obriši firme")."""
+    with session_scope() as session:
+        return year_companies(session, year)
+
+
+@router.post("/companies/delete")
+def delete_companies_route(year: int, selection: CompanyRows, username: str = Depends(require_user)) -> DeletedCompanies:
+    """Deletes the chosen companies from the year permanently, only those without data (user, 2026-11-25)."""
+    try:
+        with session_scope() as session:
+            return delete_companies(session, year, selection.rows, username)
+    except MigrationError as exc:
+        if exc.status_code < 500:
+            logger.warning("Deleting companies from %s refused: %s", year, exc)
+        raise HTTPException(exc.status_code, str(exc)) from None

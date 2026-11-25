@@ -6,7 +6,7 @@ import { CompanyTableSkeleton } from "@/components/CompanyTable";
 import { Pb1CompanyActions } from "@/components/Pb1CompanyActions";
 import { Main } from "@/components/layout/Main";
 import { HeaderSearch } from "@/components/HeaderSearch";
-import { Pb1Table } from "@/components/Pb1Table";
+import { Pb1Strip, Pb1Table } from "@/components/Pb1Table";
 import { Pb1CreateFinal, Pb1ReportSwitch } from "@/components/Pb1ReportSwitch";
 import { Pb1ComparisonTable, Pb1PreliminaryView } from "@/components/Pb1Styled";
 import { SaveStatus } from "@/components/SaveStatus";
@@ -40,6 +40,12 @@ export default function Pb1Page() {
   const requested: Pb1Report | undefined = asked === "preliminary" || asked === "final" ? asked : undefined;
   const { markSessionExpired } = useAuth();
   const { data, loading, error, onCommit, autosave, reload } = usePb1(year, row, tab, requested, markSessionExpired);
+  // The Poreski bilans strip is shown on all three tabs (user, 2026-11-25): on the other two its
+  // data is loaded beside the tab's own (same report).
+  const onBalance = tab === "poreski-bilans";
+  const balance = usePb1(year, row, "poreski-bilans", requested, markSessionExpired, !onBalance);
+  const stripData = onBalance ? data : balance.data;
+  const stripCommit = onBalance ? onCommit : balance.onCommit;
   const report: Pb1Report = data?.report ?? requested ?? "preliminary";
   const pageOf = (to: { tab?: string; report?: Pb1Report }) =>
     `/companies/${year}/${row}/pb1/${to.tab ?? tab}?report=${to.report ?? report}`;
@@ -72,47 +78,68 @@ export default function Pb1Page() {
     navigate(to);
   };
 
+  const tabsList = (
+    <Tabs value={tab} onValueChange={(next) => void leaveTo(pageOf({ tab: next }))}>
+      {/* Compact (user, 2026-11-25): narrow and taller, each title on two lines, as high as the
+          head table beside them. */}
+      <TabsList className="h-12 border">
+        {tabs.map((t) => (
+          <TabsTrigger
+            key={t.key}
+            value={t.key}
+            // A line round every tab (user, 2026-11-25: more visible), stronger on the chosen one.
+            className="border-border h-full w-22 px-1.5 text-xs leading-tight whitespace-normal data-[state=active]:border-foreground/25"
+          >
+            {t.title}
+          </TabsTrigger>
+        ))}
+      </TabsList>
+    </Tabs>
+  );
+
   return (
-    <Main>
+    // Less top padding (user, 2026-11-25: everything above the form as compact as it can be).
+    <Main className="pt-1">
       {searchable && (
         <HeaderSearch
           value={query}
           onChange={setQuery}
-          placeholder="Search the form"
+          placeholder="Pretraga obrasca"
           emptyText="Nema"
           steps={{ current: Math.min(current, Math.max(found.length - 1, 0)), total: found.length, onPrevious: () => step(-1), onNext: () => step(1) }}
         />
       )}
-      <Button variant="outline" size="sm" asChild>
-        <Link
-          to="/"
-          onClick={(e) => {
-            e.preventDefault();
-            void leaveTo("/");
-          }}
-        >
-          <ArrowLeft />
-          Back
-        </Link>
-      </Button>
-
-      <div className="mt-4 flex flex-wrap items-end justify-between gap-4">
-        <div>
-          <h1 className="text-2xl font-bold tracking-tight">{data?.company.name ?? "PB-1"}</h1>
+      {/* Compact (user, 2026-11-25: room for the strip and the table): Back, the company name, its
+          line and the save status in one row; the report switch, its steps, the actions and History
+          in the next; a line; then the strip (with the tabs) on all three tabs. */}
+      <div className="flex flex-wrap items-center justify-between gap-x-4 gap-y-2">
+        <div className="flex min-w-0 flex-wrap items-center gap-x-4 gap-y-1">
+          <Button variant="outline" size="sm" className="h-7" asChild>
+            <Link
+              to="/"
+              onClick={(e) => {
+                e.preventDefault();
+                void leaveTo("/");
+              }}
+            >
+              <ArrowLeft />
+              Nazad
+            </Link>
+          </Button>
+          <h1 className="text-xl font-bold tracking-tight">{data?.company.name ?? "PB-1"}</h1>
           <p className="text-muted-foreground text-sm">
             PB-1 · {data?.sheet ?? FALLBACK_TITLES[tab] ?? tab} · {year}
             {data?.company.pib && ` · PIB ${data.company.pib}`}
           </p>
         </div>
-        <div className="flex flex-wrap items-center gap-4">
+        <div className="flex h-7 flex-wrap items-center gap-4">
           <SaveStatus status={autosave.status} pendingCount={autosave.pendingCount} onRetry={autosave.retry} />
         </div>
       </div>
 
-
       {data && (
         // The company's two reports (user, 2026-11-17): Preliminary / Final.
-        <div className="mt-4">
+        <div className="mt-1">
           <Pb1ReportSwitch
             year={year}
             row={row}
@@ -134,18 +161,18 @@ export default function Pb1Page() {
           />
         </div>
       )}
+      {data && !finalMissing ? (
+        <Pb1Strip
+          data={stripData}
+          onCommit={stripCommit}
+          tabs={tabsList}
+          marks={onBalance ? { rows: new Set(found), current: focus } : undefined}
+        />
+      ) : (
+        <div className="mt-3">{tabsList}</div>
+      )}
 
-      <Tabs value={tab} onValueChange={(next) => void leaveTo(pageOf({ tab: next }))} className="mt-14">
-        <TabsList>
-          {tabs.map((t) => (
-            <TabsTrigger key={t.key} value={t.key}>
-              {t.title}
-            </TabsTrigger>
-          ))}
-        </TabsList>
-      </Tabs>
-
-      <div className="mt-4">
+      <div>
         {error && (
           <Alert variant="destructive">
             <AlertDescription>{error}</AlertDescription>

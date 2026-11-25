@@ -40,8 +40,8 @@ export function AppSidebar() {
               <Link to="/">
                 <AppLogo />
                 <div className="grid flex-1 text-start text-sm leading-tight">
-                  <span className="truncate font-semibold">Income Tax Reporting</span>
-                  <span className="truncate text-xs">Admin</span>
+                  <span className="truncate font-semibold">Izveštavanje o porezu na dobit</span>
+                  <span className="truncate text-xs">Administrator</span>
                 </div>
               </Link>
             </SidebarMenuButton>

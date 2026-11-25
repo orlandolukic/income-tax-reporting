@@ -17,7 +17,7 @@ export function ReportingYearSelect() {
   return (
     <div className="flex items-center gap-2">
       <Label htmlFor="reporting-year" className="text-muted-foreground">
-        Reporting year
+        Izveštajna godina
       </Label>
       <Select
         value={selectedYear !== null ? String(selectedYear) : undefined}

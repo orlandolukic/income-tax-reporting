@@ -107,7 +107,7 @@ export default function GlobalSettingsPage() {
           }
           setStatus({
             kind: "error",
-            text: err instanceof Refused ? text : `${text} Kliknite „Save changes” da pokušate ponovo.`,
+            text: err instanceof Refused ? text : `${text} Kliknite „Sačuvaj izmene” da pokušate ponovo.`,
           });
         } finally {
           setPendingCount(pending.current.size);
@@ -156,12 +156,12 @@ export default function GlobalSettingsPage() {
   return (
     <Main>
       <div className="mb-4">
-        <h1 className="text-2xl font-bold tracking-tight">Global Settings</h1>
+        <h1 className="text-2xl font-bold tracking-tight">Globalna podešavanja</h1>
         <p className="text-muted-foreground">Podešavanja koja važe za ceo sistem: za sve firme i sve godine.</p>
       </div>
       <Card>
         <CardHeader>
-          <CardTitle>PB-1 comments</CardTitle>
+          <CardTitle>PB-1 komentari</CardTitle>
           <CardDescription>
             Komentari uz redove Poreskog bilansa (pravila za sekcije obrasca). Isti su za sve firme i sve godine i menjaju
             se samo ovde; stope su brojevi i ulaze u formule. Kliknite na komentar da ga izmenite.
@@ -193,7 +193,7 @@ export default function GlobalSettingsPage() {
                   onClick={saveAll}
                 >
                   {flushing ? <Loader2 className="animate-spin" /> : <Save />}
-                  Save changes
+                  Sačuvaj izmene
                 </Button>
                 <span className="text-muted-foreground text-sm" aria-live="polite">
                   {status?.kind === "saving"

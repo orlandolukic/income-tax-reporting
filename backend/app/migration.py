@@ -54,7 +54,7 @@ from app.models import (
     SourceFile,
 )
 from app.models import SourceCell as SourceCellRow
-from app.gfi_store import text_of
+from app.gfi_store import clean_text, lookup_id, text_of
 from app.pb1_store import copy_form_settings, form_source
 from app.pb1_workbook import PB1_TABS
 
@@ -303,6 +303,8 @@ def _copy_company(
         company_id=template.company_id, year=source_file.year, source_file_id=source_file.id, source_row=row,
         name=template.name, referent_id=template.referent_id, office_id=template.office_id,
         updated_at=now, updated_by=user, active=True, **statuses,
+        # The company's type (PDP / PPDG-1S) is carried as it is (user, 2026-11-25).
+        form_type=getattr(template, "form_type", None) or "pdp",
     )
     session.add(company_year)
     details = {
@@ -450,6 +452,182 @@ def set_year_companies(session: Session, year: int, company_ids: list[int], user
         year, user, shown, added, restored, removed,
     )
     return SelectionResult(year=year, companies=shown, added=added, restored=restored, removed=removed)
+
+
+FORM_TYPES = ("pdp", "ppdg")  # PDP / PPDG-1S (user, 2026-11-25)
+
+
+class NewCompany(BaseModel):
+    name: str | None = None
+    pib: str | None = None
+    referent: str | None = None
+    office: str | None = None
+    form_type: str = "pdp"  # "pdp" or "ppdg" (PPDG-1S)
+
+
+class AddedCompany(BaseModel):
+    year: int
+    row: int  # the new company's row (source_row): the last row of the year's table
+    company_id: int
+    name: str
+
+
+def add_company(session: Session, year: int, details: NewCompany, user: str) -> AddedCompany:
+    """Adds a new company to `year` (user, 2026-11-25: Edit Company Data, "Dodaj firmu"): a new
+    company with its row at the end of the year's table. The row is built like a company of a
+    constructed year (_copy_company), from the year's last row as the template of the cells
+    (column kinds, number formats, formula flags), with the new company's details (the same
+    input rules as editing them, clean_text) and every status 0; so it behaves exactly like the
+    other rows: Home, Edit Company Data, its PB-1 form (empty amounts), the PDF report, and it is
+    carried by the next Migracija like any company of the year. Its row number is above every
+    row used in any year, so no later construction can collide with it."""
+    try:
+        name = clean_text("name", details.name)
+        pib = clean_text("pib", details.pib)
+        referent = clean_text("referent", details.referent)
+        office = clean_text("office", details.office)
+    except HTTPException as exc:
+        raise MigrationError(exc.status_code, str(exc.detail)) from None
+    if details.form_type not in FORM_TYPES:
+        raise MigrationError(status.HTTP_422_UNPROCESSABLE_CONTENT, "Tip firme mora biti PDP ili PPDG-1S.")
+    source_file = session.scalar(select(SourceFile).where(SourceFile.kind == "gfi", SourceFile.year == year))
+    if source_file is None:
+        raise MigrationError(status.HTTP_404_NOT_FOUND, f"Godina {year} ne postoji.")
+    year_rows = list(session.scalars(
+        select(CompanyYear).where(CompanyYear.year == year).options(
+            joinedload(CompanyYear.company), joinedload(CompanyYear.referent), joinedload(CompanyYear.office)
+        )
+    ))
+    if any(cy.active and cy.name == name for cy in year_rows):
+        raise MigrationError(status.HTTP_409_CONFLICT, f"Firma {name} već postoji u godini {year}.")
+    active = [cy for cy in year_rows if cy.active] or year_rows
+    if not active:
+        raise MigrationError(status.HTTP_409_CONFLICT, f"Godina {year} nema nijednu firmu po kojoj bi se napravio red.")
+    template = max(active, key=lambda cy: cy.source_row)
+    columns = list(session.scalars(
+        select(GfiColumn).where(GfiColumn.source_file_id == source_file.id).order_by(GfiColumn.position)
+    ))
+    row = (session.scalar(select(func.max(CompanyYear.source_row))) or 1) + 1
+    now = datetime.now(timezone.utc)
+    company = Company(name=name, pib=pib, created_at=now)
+    session.add(company)
+    session.flush()
+    referent_id, office_id = lookup_id(session, Referent, referent), lookup_id(session, Office, office)
+    # The new company's details in the shape _copy_company reads from its template.
+    details_row = type("NewRow", (), {
+        "company_id": company.id, "name": name, "referent_id": referent_id, "office_id": office_id,
+        "form_type": details.form_type,
+        "company": company,
+        "referent": session.get(Referent, referent_id) if referent_id else None,
+        "office": session.get(Office, office_id) if office_id else None,
+    })()
+    _copy_company(session, source_file, columns, details_row, _source_cells(session, template), row, now, user)
+    session.flush()
+    logger.info(
+        "Company %r (PIB %s) added to %s by '%s' as row %d (template row %d)",
+        name, pib, year, user, row, template.source_row,
+    )
+    return AddedCompany(year=year, row=row, company_id=company.id, name=name)
+
+
+class YearCompany(BaseModel):
+    row: int
+    name: str
+    pib: str | None = None
+    referent: str | None = None
+    office: str | None = None
+    # Why it can't be deleted (it holds entered data), or None when it can.
+    blocked: str | None = None
+
+
+class CompanyRows(BaseModel):
+    rows: list[int]
+
+
+class DeletedCompanies(BaseModel):
+    year: int
+    deleted: int
+    companies_removed: int  # companies no other year uses, removed with their last row
+
+
+def _blocked_reason(session: Session, company_year: CompanyYear) -> str | None:
+    """Why a company of a year can't be deleted: it holds data entered in the app (user,
+    2026-11-25: only companies without data are deleted)."""
+    cy_id = company_year.id
+    checks = (
+        (Pb1CompanyEdit, "ima PB-1 iznose"),
+        (Pb1ReportState, "ima korake izveštaja"),
+        (Pb1ReportEvent, "ima istoriju izveštaja"),
+        (Pb1Link, "vezana je za PB-1 obrazac"),
+        (ChangeLog, "ima istoriju izmena"),
+    )
+    for model, reason in checks:
+        query = select(model.company_year_id).where(model.company_year_id == cy_id)
+        if model is ChangeLog:
+            # Only edits made by people: the automatic entries of a schema migration (e.g.
+            # "migration 0020", statuses aligned with the report steps) are not data entered.
+            query = query.where(ChangeLog.changed_by.not_like("migration %"))
+        if session.scalar(query.limit(1)) is not None:
+            return reason
+    if any(getattr(company_year, field) != ZERO for field in NUMERIC_FIELDS):
+        return "ima postavljen status"
+    return None
+
+
+def year_companies(session: Session, year: int) -> list[YearCompany]:
+    """The companies shown in `year` (table order) with whether each can be deleted."""
+    rows = session.scalars(
+        select(CompanyYear).where(CompanyYear.year == year, CompanyYear.active).order_by(CompanyYear.source_row).options(
+            joinedload(CompanyYear.company), joinedload(CompanyYear.referent), joinedload(CompanyYear.office)
+        )
+    )
+    return [
+        YearCompany(
+            row=cy.source_row, name=cy.name, pib=cy.company.pib,
+            referent=cy.referent.name if cy.referent else None, office=cy.office.name if cy.office else None,
+            blocked=_blocked_reason(session, cy),
+        )
+        for cy in rows
+    ]
+
+
+def delete_companies(session: Session, year: int, rows: list[int], user: str) -> DeletedCompanies:
+    """Deletes companies from `year` permanently (user, 2026-11-25: Edit Company Data, "Obriši
+    firme"): their row (company_year and its snapshot cells); the company itself when no other
+    year has it; a referent / office no company uses any more. Only companies without data
+    entered in the app (_blocked_reason); if any of the chosen ones has data, nothing is deleted
+    (409). Nothing of other companies or years changes."""
+    from app.gfi_store import _drop_if_unused  # noqa: PLC0415
+
+    wanted = set(rows)
+    if not wanted:
+        raise MigrationError(status.HTTP_422_UNPROCESSABLE_CONTENT, "Izaberite bar jednu firmu.")
+    found = {
+        cy.source_row: cy
+        for cy in session.scalars(select(CompanyYear).where(CompanyYear.year == year, CompanyYear.source_row.in_(wanted)))
+    }
+    missing = sorted(wanted - set(found))
+    if missing:
+        raise MigrationError(status.HTTP_404_NOT_FOUND, f"U godini {year} nema firmi u redovima {missing[:10]}.")
+    blocked = [(cy.name, reason) for cy in found.values() if (reason := _blocked_reason(session, cy))]
+    if blocked:
+        names = ", ".join(f"{name} ({reason})" for name, reason in blocked[:5])
+        raise MigrationError(status.HTTP_409_CONFLICT, f"Ne brišu se firme sa podacima: {names}. Ništa nije obrisano.")
+    removed = 0
+    for cy in found.values():
+        company_id, referent_id, office_id = cy.company_id, cy.referent_id, cy.office_id
+        session.execute(delete(SourceCellRow).where(
+            SourceCellRow.source_file_id == cy.source_file_id, SourceCellRow.row == cy.source_row
+        ))
+        session.delete(cy)
+        session.flush()
+        if session.scalar(select(CompanyYear.id).where(CompanyYear.company_id == company_id).limit(1)) is None:
+            session.execute(delete(Company).where(Company.id == company_id))
+            removed += 1
+        _drop_if_unused(session, Referent, CompanyYear.referent_id, referent_id)
+        _drop_if_unused(session, Office, CompanyYear.office_id, office_id)
+        logger.info("Company %r (row %d) deleted from %s by '%s'", cy.name, cy.source_row, year, user)
+    return DeletedCompanies(year=year, deleted=len(found), companies_removed=removed)
 
 
 # Company details stored once per company (company table) and shared by all its years.

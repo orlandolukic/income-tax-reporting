@@ -135,20 +135,20 @@ export function CompanySelectDialog({
           <Input
             value={query}
             onChange={(e) => setQuery(e.target.value)}
-            placeholder="Search: name, PIB, referent, office"
+            placeholder="Pretraga: naziv, PIB, referent, kancelarija"
             className="min-w-48 flex-1"
-            aria-label="Search companies"
+            aria-label="Pretraga firmi"
           />
           <Button variant="outline" size="sm" onClick={() => setAll(true)} disabled={!companies}>
-            Select all
+            Izaberi sve
           </Button>
           <Button variant="outline" size="sm" onClick={() => setAll(false)} disabled={!companies}>
-            Clear all
+            Poništi izbor
           </Button>
         </div>
         <p className="text-muted-foreground text-sm">
-          {companies ? `Selected ${selected.size} of ${companies.length}` : "Učitavanje registra…"}
-          {companies && query.trim() !== "" && ` · shown ${shown.length}`}
+          {companies ? `Izabrano ${selected.size} od ${companies.length}` : "Učitavanje registra…"}
+          {companies && query.trim() !== "" && ` · prikazano ${shown.length}`}
         </p>
 
         <div className="max-h-[50vh] overflow-auto rounded-md border">

@@ -7,8 +7,9 @@ import {
   TableHeader,
   TableRow,
 } from "@/components/ui/table";
+import { CalendarClock, Landmark, Percent, Scale } from "lucide-react";
 import { Badge } from "@/components/ui/badge";
-import type { Pb1Cell, Pb1Column, Pb1Commit, Pb1Data, Pb1Result, Pb1Row } from "@/hooks/use-pb1";
+import type { Pb1Cell, Pb1Column, Pb1Commit, Pb1Data, Pb1HeadFigure, Pb1Result, Pb1Row } from "@/hooks/use-pb1";
 import { formatNumber, parseNumberInput, toEditText, withDecimals } from "@/lib/excel-format";
 import { cn } from "@/lib/utils";
 
@@ -90,11 +91,16 @@ function FieldEditor({
   cell,
   alignEnd,
   dashEmpty,
+  overlay,
   onDone,
 }: {
   cell: Pb1Cell;
   alignEnd: boolean;
   dashEmpty?: boolean; // "-" means empty (Konto)
+  // The editor floats over the cell, as wide as the value being typed (at least the cell), anchored
+  // at the cell's right edge, so the whole value is in sight and nothing around moves (Klasa 5 / 6
+  // in the strip, user 2026-11-25).
+  overlay?: boolean;
   onDone: (value: number | string | null | undefined) => void; // undefined = cancel
 }) {
   const isNumber = Boolean(cell.number);
@@ -149,7 +155,7 @@ function FieldEditor({
   };
   const common = {
     autoFocus: true,
-    "aria-label": "Field value",
+    "aria-label": "Vrednost polja",
     "aria-invalid": invalid || undefined,
     title: invalid ? "Unesite broj, npr. 1.234,56" : undefined,
     value: text,
@@ -160,7 +166,9 @@ function FieldEditor({
     className: cn(
       "border-ring ring-ring/50 bg-background aria-invalid:border-destructive aria-invalid:ring-destructive/20 w-full min-w-0 rounded-sm border px-1.5 py-0.5 font-normal ring-[3px] outline-none",
       alignEnd ? "text-end tabular-nums" : "text-start",
+      overlay && "absolute top-1/2 right-0 z-20 min-w-full -translate-y-1/2 shadow-md",
     ),
+    style: overlay ? { width: `${Math.max(text.length + 3, 10)}ch` } : undefined,
   };
   if (isNumber) {
     return (
@@ -221,6 +229,7 @@ export function FieldCell({
   onCommit,
   adornment,
   className,
+  wideEditor,
 }: {
   cell: Pb1Cell;
   column: Pb1Column;
@@ -230,16 +239,38 @@ export function FieldCell({
   onCommit: (value: number | string | null) => void;
   adornment?: ReactNode;
   className?: string;
+  wideEditor?: boolean; // the editor floats over the cell, as wide as the value (FieldEditor overlay)
 }) {
   const [editing, setEditing] = useState(false);
   const shown = display(cell);
   const { text, isNumber } = shown;
-  // Prekoracenje column (user, 2026-11-17): an overrun (> 0) red, under the limit (< 0) green;
-  // elsewhere every negative number red. Computed from the value, so it follows the recomputed
-  // formulas at once.
-  const overrun = Boolean(column.overrun) && typeof cell.value === "number" ? Math.sign(cell.value) : 0;
-  const red = overrun > 0 || (shown.red && overrun === 0);
-  const green = overrun < 0;
+  // Prekoracenje column (user, 2026-11-17): an overrun (> 0) red, or green on a line with "-" in
+  // the line 59 formula (user, 2026-11-25); it is never negative (0 when Ostvareni <= Priznati,
+  // user 2026-11-22). Elsewhere every negative number red. Computed from the value, so it follows
+  // the recomputed formulas at once.
+  // A section's subtotal (shaded Roman-numeral rows, on a soft brand background, user 2026-11-25):
+  // above 0 red, below 0 green with its minus sign (the supervisor's rule).
+  const subtotal = Boolean(cell.subtotal);
+  const number = typeof cell.value === "number" ? cell.value : 0;
+  const overrun = Boolean(column.overrun) && !subtotal && number > 0;
+  // Klasa 5 / Klasa 6 (user, 2026-11-25): expenses red, revenue green, without a sign; the
+  // Saldo (Klasa 6 - 5) by its sign: a profit green, a loss red with its minus.
+  const green =
+    cell.tone === "balance"
+      ? number > 0
+      : cell.tone
+        ? cell.tone === "income"
+        : subtotal
+          ? number < 0
+          : overrun && Boolean(cell.minus);
+  const red =
+    cell.tone === "balance"
+      ? number < 0
+      : cell.tone
+        ? cell.tone === "expense"
+        : subtotal
+          ? number > 0
+          : (overrun && !green) || shown.red;
   const canEdit = Boolean(cell.editable);
   // Numbers written as text (konto lists such as "57, 58"): no words.
   const numericText = !isNumber && text.trim() !== "" && !LETTER.test(text);
@@ -277,6 +308,10 @@ export function FieldCell({
         cell.bold && "font-semibold",
         red && "text-destructive",
         green && "text-success",
+        subtotal && "bg-brand/15",
+        // A fixed, computed value (formula; not editable) on all three tabs: hatched grey (user,
+        // 2026-11-25). Not the subtotals (own background) nor the head cells with a sheet fill.
+        cell.formula && !subtotal && !cell.fill && "bg-locked",
         cell.fill && FILL,
         canEdit && "focus-visible:ring-ring/50 outline-none focus-visible:ring-[3px] focus-visible:ring-inset",
         // Clickable (opens the editor): pointing hand, as everything clickable in the app.
@@ -288,11 +323,13 @@ export function FieldCell({
         className,
       )}
     >
+      {editing && wideEditor && <span className="invisible">{text}</span>}
       {editing ? (
         <FieldEditor
           cell={cell}
           alignEnd={alignEnd}
           dashEmpty={column.dash_empty}
+          overlay={wideEditor}
           onDone={(value) => {
             setEditing(false);
             // Nothing changed (e.g. an amount shown as 0,00 over " " left empty): nothing to save.
@@ -386,7 +423,7 @@ function Pb1RowView({
   const number = row.cells.A?.value;
   const description = String(row.cells.B?.value ?? "").trim();
   const title = [
-    "Comment",
+    "Komentar",
     number !== null && number !== undefined && number !== "" ? String(number) : "",
     description,
   ].filter(Boolean).join(" · ");
@@ -484,58 +521,12 @@ export function Pb1Table({
   return (
     <>
       {tips && <CommentTipLayer tips={showTip} />}
-      {(head.length > 0 || summary.length > 0) && (
-        // One strip, always on one line (no wrapping): the head rows, then the closing rows with
-        // the two results, over the full width. It sticks right under the page header while the
-        // page scrolls, so it stays wholly in sight (user, 2026-11-17; before, its top went under
-        // the blurred header). Not stuck on phones.
-        <div className="bg-background mb-3 flex flex-nowrap items-stretch gap-3 overflow-x-auto py-2 sm:sticky sm:top-16 sm:z-30">
-          {head.length > 0 && (
-            // The sheet's first rows (Poreski bilans: title, company name, class 5/6 totals) as a
-            // separate table at the top left. Its own columns (with the comment column's head
-            // cells), one to one with the form's; its empty first and last columns (# and Konto)
-            // are left out. Its first column (title, company name) is only as wide as its texts
-            // (user, 2026-11-15), so the closing rows fit beside it.
-            <div className="shrink-0">
-              <AlignedTable
-                rows={head}
-                columns={compactFirstColumn(head, headColumns, usedColumns(head, headColumns))}
-                range={usedColumns(head, headColumns)}
-                onCommit={onCommit}
-                mergeFirstDown
-              />
-            </div>
-          )}
-          {summary.length > 0 && (
-            // The form's closing rows (Poreski bilans: V. Poreska osnovica, Poreska osnovica,
-            // Porez 15%, Mesecna akontacija) beside the head rows, always in sight (user, 2026-11-15):
-            // only their description and amount (no line number, no empty columns). With the
-            // accounting and tax result right of them, one section (user, 2026-11-17; the tax
-            // result replaces the "Gubitak!" banner above the tabs).
-            <div className="bg-card flex min-w-0 flex-1 items-stretch gap-3 rounded-lg border p-2">
-              <div className="shrink-0">
-                <SummaryBox rows={summary} columns={columns} onCommit={onCommit} tips={tips} marks={marks} />
-              </div>
-              {data.results && (
-                // The two results side by side, each a normal-width tile, spaced out over the
-                // free width (user, 2026-11-17).
-                <div className="flex flex-1 items-stretch justify-evenly gap-6 px-2">
-                  <ResultTile label="Knjigovodstveni rezultat" result={data.results.accounting} />
-                  <ResultTile
-                    label="Poreski rezultat"
-                    result={data.results.tax}
-                    note={data.results.tax.status === "loss" ? "Porez i mesečna akontacija su 0." : undefined}
-                  />
-                </div>
-              )}
-            </div>
-          )}
-        </div>
-      )}
-
-      {/* Fits the screen below the header and the sticky strip (4rem + about 11rem + gaps), so its
-          top edge never goes under the strip. */}
-      <div className="max-h-[calc(100svh-18rem)] overflow-auto rounded-md border">
+      {/* As tall as the window below the page header (4rem) and the stuck strip (about 4.5rem)
+          plus the bottom padding (1.5rem): at the top the table starts at about 203 px; once the
+          page is scrolled only the strip stays in sight (stuck) and the table grows by the
+          height of the rows above it (user, 2026-11-25). If the strip's height changes, change
+          10rem here (see Pb1Strip, layout rule 4). */}
+      <div className="max-h-[calc(100svh-10rem)] overflow-auto rounded-md border">
         <table className="w-full caption-bottom text-sm">
           <colgroup>
             {columns.map((column) => (
@@ -576,26 +567,231 @@ const RESULT_STATUS: Record<Pb1Result["status"], { text: string; className: stri
 };
 
 /** A result (computed by the backend): its label, a profit / loss badge and the amount. */
-function ResultTile({ label, result, note }: { label: string; result: Pb1Result; note?: string }) {
+function ResultTile({
+  label,
+  result,
+  note,
+  plain,
+  className,
+}: {
+  label: string;
+  result: Pb1Result;
+  note?: string;
+  // No badge and no colour (Poreski rezultat, user 2026-11-25); else the badge, and the amount
+  // green above 0, red with its minus below 0 (Knjigovodstveni rezultat, the balance 6 - 5).
+  plain?: boolean;
+  className?: string;
+}) {
   const status = RESULT_STATUS[result.status];
   // A tile of normal width over the strip's height: label and badge at the top, the amount
   // below (and the note); nothing wraps.
   return (
-    <div className="flex w-64 flex-col justify-between gap-2 rounded-md border px-4 py-3 whitespace-nowrap">
+    <div className={cn("bg-card flex min-w-56 flex-col justify-between gap-1 rounded-md border px-4 py-2 whitespace-nowrap", className)}>
       <div className="flex items-center justify-between gap-3">
         <span className="text-muted-foreground text-xs font-medium">{label}</span>
-        <Badge variant="outline" className={status.className}>
-          {status.text}
-        </Badge>
+        {!plain && (
+          <Badge variant="outline" className={status.className}>
+            {status.text}
+          </Badge>
+        )}
       </div>
       <div className="grid justify-items-end gap-0.5">
-        <span className={cn("text-xl font-semibold tabular-nums", result.value < 0 && "text-destructive")}>
+        <span
+          className={cn(
+            "text-xl font-semibold tabular-nums",
+            !plain && result.value < 0 && "text-destructive",
+            !plain && result.value > 0 && "text-success",
+          )}
+        >
           {formatNumber(result.value, "#,##0.00").text}
         </span>
-        <span className={cn("text-xs", note ? "text-destructive" : "invisible")}>{note ?? "-"}</span>
+        <span className={cn("text-xs", note ? "text-muted-foreground" : "invisible")}>{note ?? "-"}</span>
       </div>
     </div>
   );
+}
+
+/**
+ * The strip of Poreski bilans, on all three tabs (user, 2026-11-25), stuck right under the page
+ * header while the page scrolls (not on phones): the tabs (two-line titles) with the head table
+ * right of them; the two results one under the other; Porez (15%) over Mesecna akontacija.
+ * `data` is always the Poreski bilans tab.
+ *
+ * LAYOUT RULES: keep them, so the strip holds with other numbers and texts (user, 2026-11-25:
+ * "it must not fall apart on a small difference"):
+ * 1. Nothing in it wraps or is cut: every label and amount is `whitespace-nowrap`, every tile
+ *    and row is at least as wide as its content (`min-w-max` on the result rows, `shrink-0` on
+ *    the tabs / head table / closing column). Never use fixed widths for amounts: a longer
+ *    amount (e.g. -123.456.789,00) makes its tile wider, it never overlaps a neighbour.
+ * 2. Only the results column grows (`flex-1`): it takes the free width; the other parts keep
+ *    their content width. No sideways scrolling (user, 2026-11-25: arrange it, there is room):
+ *    the line must fit; keep the spare width (about 280 px at 1536 px with 1. OKTOBAR 2026)
+ *    by keeping gaps and paddings small (gap-2, px-2.5, tabs w-22). No overflow clipping
+ *    anywhere in the strip either: the Klasa 5 / 6 editor floats over its cell
+ *    (FieldCell wideEditor), as wide as the value typed, and must not be cut.
+ * 3. Amounts are `tabular-nums`, right-aligned at the row's end, so the two results line up.
+ * 4. The strip's height is fixed by its rows, not by its contents: two rows of about 28 px
+ *    (head table h-6 + py-0.5 cells; result and closing rows share the height with `grid`),
+ *    the tabs `h-12`. A taller strip moves the form table below 204 px at the top; if the
+ *    strip's height changes, adjust the table's max-h in Pb1Table (window - header - strip).
+ * 5. Colours only through theme tokens (text-success / text-destructive, border-l-*), so light
+ *    and dark both work.
+ */
+export function Pb1Strip({
+  data,
+  onCommit,
+  tabs,
+  marks,
+}: {
+  data: Pb1Data | null;
+  onCommit: Pb1Commit;
+  tabs: ReactNode;
+  marks?: Pb1SearchMarks;
+}) {
+  const head = data?.head ?? [];
+  const summary = data?.summary ?? [];
+  const columns = data?.columns ?? [];
+  const headColumns = data?.head_columns?.length === columns.length ? data.head_columns : columns;
+  // The closing rows after the tax base (Porez (15%), Mesecna akontacija): label and value.
+  const closing = closingFigures(summary, columns).slice(1);
+  const accounting = data?.results?.accounting;
+  const tax = data?.results?.tax;
+  const closingIcons = [Percent, CalendarClock];
+  return (
+    // Framed (user, 2026-11-25): a rounded border with a soft muted background, the tiles on the
+    // card colour inside; the outer band (page background) covers the form when stuck. One low
+    // line: the tabs with the head table right of them, the two results one under the other
+    // (narrow, value in the middle, a coloured edge and an icon), Porez (15%) over Mesecna
+    // akontacija.
+    <div className="bg-background pt-1 pb-1 sm:sticky sm:top-16 sm:z-30">
+      <div className="bg-muted/50 flex flex-nowrap items-stretch gap-2 rounded-lg border p-1">
+        <div className="flex shrink-0 items-center gap-2">
+          {tabs}
+          {data && head.length > 0 && data.head_figures && data.head_figures.length > 0 ? (
+            <HeadFigures head={head} figures={data.head_figures} onCommit={onCommit} />
+          ) : head.length > 0 ? (
+            <AlignedTable
+              rows={head}
+              columns={compactFirstColumn(head, headColumns, usedColumns(head, headColumns))}
+              range={usedColumns(head, headColumns)}
+              onCommit={onCommit}
+              mergeFirstDown
+            />
+          ) : null}
+        </div>
+        {accounting && tax && (
+          <div className="grid min-w-max flex-1 gap-1">
+            <ResultRow
+              icon={Scale}
+              label="Knjigovodstveni rezultat (6 - 5)"
+              result={accounting}
+              edge={accounting.value > 0 ? "border-l-success" : accounting.value < 0 ? "border-l-destructive" : "border-l-border"}
+            />
+            <ResultRow
+              icon={Landmark}
+              label="Poreski rezultat (poreska osnovica)"
+              result={tax}
+              plain
+              edge="border-l-brand"
+              note={tax.status === "loss" ? "Porez i akontacija su 0." : undefined}
+            />
+          </div>
+        )}
+        {closing.length > 0 && (
+          <div className="grid shrink-0 gap-1">
+            {closing.map((figure, index) => {
+              const Icon = closingIcons[index] ?? Percent;
+              return (
+                <div
+                  key={figure.row}
+                  data-pb1-row={figure.row}
+                  className={cn(
+                    "bg-card flex items-center gap-2 rounded-md border px-2.5 whitespace-nowrap",
+                    markClass({ row: figure.row, cells: {} }, marks),
+                  )}
+                >
+                  <Icon className="text-muted-foreground size-3.5 shrink-0" />
+                  <span className="text-muted-foreground text-xs font-medium">{figure.label}</span>
+                  <span className={cn("ms-auto text-sm font-semibold tabular-nums", figure.red && "text-destructive")}>
+                    {figure.text}
+                  </span>
+                </div>
+              );
+            })}
+          </div>
+        )}
+      </div>
+    </div>
+  );
+}
+
+/**
+ * One result as a low row (user, 2026-11-25): icon and label left, the badge and the amount at the
+ * right edge, a coloured left edge. Knjigovodstveni rezultat: its badge, the amount green above 0 and red with
+ * the minus below 0; Poreski rezultat (`plain`): no badge, no colour.
+ */
+function ResultRow({
+  icon: Icon,
+  label,
+  result,
+  plain,
+  edge,
+  note,
+}: {
+  icon: typeof Scale;
+  label: string;
+  result: Pb1Result;
+  plain?: boolean;
+  edge: string;
+  note?: string;
+}) {
+  const status = RESULT_STATUS[result.status];
+  return (
+    // Never narrower than its content (min-w-max): the strip scrolls instead of overlapping.
+    <div className={cn("bg-card grid min-w-max grid-cols-[auto_1fr_auto] items-center gap-2 rounded-md border border-l-4 px-2.5 whitespace-nowrap", edge)}>
+      <span className="text-muted-foreground flex items-center gap-2 text-xs font-medium">
+        <Icon className="size-4 shrink-0" />
+        {label}
+      </span>
+      {/* The badge (or the loss note) left of the amount, the amount at the right edge (user,
+          2026-11-25), so the amounts of both rows line up. */}
+      <span className="flex justify-end">
+        {!plain ? (
+          <Badge variant="outline" className={status.className}>
+            {status.text}
+          </Badge>
+        ) : note ? (
+          <span className="text-muted-foreground text-xs">{note}</span>
+        ) : null}
+      </span>
+      <span
+        className={cn(
+          "justify-self-end text-base font-bold tabular-nums",
+          !plain && result.value < 0 && "text-destructive",
+          !plain && result.value > 0 && "text-success",
+        )}
+      >
+        {formatNumber(result.value, "#,##0.00").text}
+      </span>
+    </div>
+  );
+}
+
+/** The closing rows with a value as label + shown value (no line number). */
+function closingFigures(rows: Pb1Row[], columns: Pb1Column[]) {
+  const figures: { row: number; label: string; text: string; red: boolean }[] = [];
+  for (const row of rows) {
+    const label = columns
+      .filter((c) => !c.narrow && !c.amount)
+      .map((c) => display(row.cells[c.key] ?? {}).text.trim())
+      .find(Boolean);
+    const value = columns.map((c) => (c.amount ? row.cells[c.key] : undefined)).find((cell) => cell?.amount);
+    if (label && value) {
+      const shown = display(value);
+      figures.push({ row: row.row, label, text: shown.text, red: shown.red });
+    }
+  }
+  return figures;
 }
 
 /**
@@ -630,17 +826,9 @@ function SummaryBox({
           {rows.map((row) => {
             // The box's heading ("V. Poreska osnovica": a row without any amount field): one cell
             // over the whole width, no inner border, darker than the rest (user, 2026-11-17).
+            // Not shown any more (user, 2026-11-25): only the three rows with a value remain.
             const heading = shown.every((c) => !row.cells[c.key]?.amount && !row.cells[c.key]?.editable);
-            if (heading) {
-              const text = shown.map((c) => display(row.cells[c.key] ?? {}).text.trim()).filter(Boolean).join(" ");
-              return (
-                <TableRow key={row.row} data-pb1-row={row.row} className="bg-foreground/10 hover:bg-foreground/10">
-                  <TableCell colSpan={shown.length} className="py-2 font-semibold">
-                    {text}
-                  </TableCell>
-                </TableRow>
-              );
-            }
+            if (heading) return null;
             return <Pb1RowView key={row.row} row={row} columns={shown} onCommit={onCommit} tips={tips} marks={marks} />;
           })}
         </TableBody>
@@ -672,6 +860,53 @@ function usedColumns(rows: Pb1Row[], columns: Pb1Column[]): ColumnRange {
   while (end > 1 && !used(end - 1)) end--;
   while (start < end - 1 && !used(start)) start++;
   return { start, end };
+}
+
+/** The head of Poreski bilans as labelled values: one row of labels, one row of values (fields). */
+function HeadFigures({
+  head,
+  figures,
+  onCommit,
+}: {
+  head: Pb1Row[];
+  figures: Pb1HeadFigure[];
+  onCommit: Pb1Commit;
+}) {
+  const cellOf = (figure: Pb1HeadFigure): Pb1Cell => {
+    const cell = head.find((r) => r.row === figure.row)?.cells[figure.column] ?? {};
+    return { ...cell, fill: undefined }; // no sheet colours here
+  };
+  return (
+    // No overflow clipping: the Klasa 5 / 6 editor floats over the cell, wider than it.
+    <div className="bg-card w-fit rounded-md border">
+      <table className="caption-bottom text-sm">
+        <TableBody>
+          <TableRow className="bg-muted/60 hover:bg-muted/60">
+            {figures.map((figure) => (
+              <TableHead
+                key={`${figure.row}${figure.column}`}
+                className={cn("text-muted-foreground h-6 px-2 text-end text-xs font-medium", COLUMN_BORDER)}
+              >
+                {figure.label}
+              </TableHead>
+            ))}
+          </TableRow>
+          <TableRow className="hover:bg-transparent">
+            {figures.map((figure) => (
+              <FieldCell
+                key={`${figure.row}${figure.column}`}
+                cell={cellOf(figure)}
+                column={{ key: figure.column, width: 14, amount: true }}
+                onCommit={(value) => onCommit(figure.row, figure.column, value)}
+                className="min-w-24 px-2 py-0.5"
+                wideEditor
+              />
+            ))}
+          </TableRow>
+        </TableBody>
+      </table>
+    </div>
+  );
 }
 
 /**
@@ -769,7 +1004,7 @@ export function Pb1Comments({
   return (
     <div className={cn("flex max-h-[calc(100svh-16rem)] flex-col rounded-md border", className)}>
       <div className="bg-muted border-b px-3 py-2 text-sm font-medium">
-        Comments
+        Komentari
         {note && <p className="text-muted-foreground mt-0.5 text-xs font-normal">{note}</p>}
       </div>
       <ul className="overflow-auto text-sm">

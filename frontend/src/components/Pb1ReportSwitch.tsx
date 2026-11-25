@@ -34,8 +34,8 @@ const logger = getLogger("pb1Report");
  */
 
 const OPTIONS: { key: Pb1Report; label: string }[] = [
-  { key: "preliminary", label: "Preliminary" },
-  { key: "final", label: "Final" },
+  { key: "preliminary", label: "Preliminarni" },
+  { key: "final", label: "Konačni" },
 ];
 
 type ReportAction =
@@ -52,38 +52,38 @@ type ReportAction =
 const CONFIRM: Partial<Record<ReportAction, { title: string; text: string; label: string }>> = {
   "preliminary-done": {
     title: "Označiti preliminarni izveštaj kao gotov?",
-    text: "Preliminarni izveštaj se zaključava: posle se može samo gledati. Na Home se kolona Preliminarni za ovu firmu postavlja na 1, a zatim se prelazi na konačni izveštaj.",
-    label: "Mark as done",
+    text: "Preliminarni izveštaj se zaključava: posle se može samo gledati. Na Početnoj se kolona Preliminarni za ovu firmu postavlja na 1, a zatim se prelazi na konačni izveštaj.",
+    label: "Označi kao gotov",
   },
   "gfi-done": {
     title: "Označiti GFI kao gotov?",
-    text: "Godišnji finansijski izveštaj je završen i konačni PB-1 izveštaj može da se napravi na njemu. Na Home se kolona GFI uradjen za ovu firmu postavlja na 1.",
-    label: "Mark GFI as done",
+    text: "Godišnji finansijski izveštaj je završen i konačni PB-1 izveštaj može da se napravi na njemu. Na Početnoj se kolona GFI uradjen za ovu firmu postavlja na 1.",
+    label: "Označi GFI kao gotov",
   },
   "gfi-reopen": {
     title: "Ponovo otvoriti GFI?",
-    text: "GFI više nije označen kao gotov i konačni izveštaj ne može da se napravi dok se GFI ponovo ne označi. Na Home se kolona GFI uradjen za ovu firmu vraća na 0.",
-    label: "Reopen GFI",
+    text: "GFI više nije označen kao gotov i konačni izveštaj ne može da se napravi dok se GFI ponovo ne označi. Na Početnoj se kolona GFI uradjen za ovu firmu vraća na 0.",
+    label: "Ponovo otvori GFI",
   },
   "final-done": {
     title: "Označiti konačni izveštaj kao gotov?",
-    text: "Konačni izveštaj se zaključava: može se gledati i štampati, ali ne i menjati, dok se ne otključa. Na Home se kolona PB-1, PB-2 za ovu firmu postavlja na 1.",
-    label: "Mark as done",
+    text: "Konačni izveštaj se zaključava: može se gledati i štampati, ali ne i menjati, dok se ne otključa. Na Početnoj se kolona PB-1, PB-2 za ovu firmu postavlja na 1.",
+    label: "Označi kao gotov",
   },
   "final-unlock": {
     title: "Otključati konačni izveštaj?",
-    text: "Konačni izveštaj ponovo može da se menja. Na Home se kolona PB-1, PB-2 za ovu firmu vraća na 0, dok se izveštaj ponovo ne označi kao gotov.",
-    label: "Unlock",
+    text: "Konačni izveštaj ponovo može da se menja. Na Početnoj se kolona PB-1, PB-2 za ovu firmu vraća na 0, dok se izveštaj ponovo ne označi kao gotov.",
+    label: "Otključaj",
   },
   submitted: {
     title: "Označiti izveštaj kao predat?",
-    text: "Upisuju se datum i vreme predaje. Na Home se kolona PB-1, PB-2 Predat za ovu firmu postavlja na 1. Dok je izveštaj predat, konačni izveštaj ne može da se otključa.",
-    label: "Mark as submitted",
+    text: "Upisuju se datum i vreme predaje. Na Početnoj se kolona PB-1, PB-2 Predat za ovu firmu postavlja na 1. Dok je izveštaj predat, konačni izveštaj ne može da se otključa.",
+    label: "Označi kao predat",
   },
   "submission-withdrawn": {
     title: "Povući predaju izveštaja?",
-    text: "Pažnja: ovo je samo za ispravku posle predaje (npr. izmenjena prijava). Na Home se kolona PB-1, PB-2 Predat vraća na 0, a konačni izveštaj posle toga može da se otključa. Predaja i povlačenje ostaju u istoriji.",
-    label: "Withdraw submission",
+    text: "Pažnja: ovo je samo za ispravku posle predaje (npr. izmenjena prijava). Na Početnoj se kolona PB-1, PB-2 Predat vraća na 0, a konačni izveštaj posle toga može da se otključa. Predaja i povlačenje ostaju u istoriji.",
+    label: "Povuci predaju",
   },
 };
 
@@ -162,17 +162,18 @@ export function Pb1ReportSwitch({
 
   return (
     <div className="grid gap-2">
-      <div className="flex flex-wrap items-center gap-3">
+      {/* Small buttons a little lower in this row (user, 2026-11-25: the form starts higher). */}
+      <div className="flex flex-wrap items-center gap-3 [&_[data-size=sm]]:h-7">
         <div
           role="radiogroup"
-          aria-label="Report"
-          className="bg-muted relative inline-grid grid-cols-2 rounded-full border p-1 shadow-inner"
+          aria-label="Izveštaj"
+          className="bg-muted relative inline-grid grid-cols-2 rounded-full border p-0.5 shadow-inner"
         >
           {/* The sliding thumb under the chosen report. */}
           <span
             aria-hidden
             className={cn(
-              "bg-background absolute inset-y-1 left-1 w-[calc(50%-0.25rem)] rounded-full border shadow-sm transition-transform duration-200",
+              "bg-background absolute inset-y-0.5 left-0.5 w-[calc(50%-0.125rem)] rounded-full border shadow-sm transition-transform duration-200",
               report === "final" && "translate-x-full",
             )}
           />
@@ -189,7 +190,7 @@ export function Pb1ReportSwitch({
                 title={disabled ? "Konačni izveštaj se otvara kada se preliminarni označi kao gotov." : undefined}
                 onClick={() => !active && onSelect(option.key)}
                 className={cn(
-                  "relative z-10 inline-flex min-w-28 items-center justify-center gap-1.5 rounded-full px-4 py-1.5 text-sm font-medium transition-colors",
+                  "relative z-10 inline-flex min-w-28 items-center justify-center gap-1.5 rounded-full px-4 py-0.5 text-sm font-medium transition-colors",
                   active ? "text-foreground" : "text-muted-foreground hover:text-foreground",
                   disabled && "hover:text-muted-foreground cursor-not-allowed opacity-50",
                 )}
@@ -212,7 +213,7 @@ export function Pb1ReportSwitch({
             onClick={() => setConfirming(report === "preliminary" ? "preliminary-done" : "final-done")}
           >
             {busy ? <Loader2 className="animate-spin" /> : <CheckCheck />}
-            Mark as done
+            Označi kao gotov
           </Button>
         )}
         {report === "final" && finalDone && !submitted && (
@@ -225,7 +226,7 @@ export function Pb1ReportSwitch({
               onClick={() => setConfirming("submitted")}
             >
               {busy ? <Loader2 className="animate-spin" /> : <Send />}
-              Mark as submitted
+              Označi kao predat
             </Button>
             <Button
               variant="outline"
@@ -235,7 +236,7 @@ export function Pb1ReportSwitch({
               onClick={() => setConfirming("final-unlock")}
             >
               {busy ? <Loader2 className="animate-spin" /> : <LockOpen />}
-              Unlock
+              Otključaj
             </Button>
           </>
         )}
@@ -243,7 +244,7 @@ export function Pb1ReportSwitch({
           <>
             <Badge variant="outline" className="border-success/40 bg-success/10 text-success gap-1.5 py-1">
               <Send className="size-3.5" />
-              Submitted · {formatDateTime(submittedAt)}
+              Predato · {formatDateTime(submittedAt)}
             </Badge>
             {report === "final" && (
               <Button
@@ -254,7 +255,7 @@ export function Pb1ReportSwitch({
                 onClick={() => setConfirming("submission-withdrawn")}
               >
                 {busy ? <Loader2 className="animate-spin" /> : <Undo2 />}
-                Withdraw submission
+                Povuci predaju
               </Button>
             )}
           </>
@@ -267,7 +268,7 @@ export function Pb1ReportSwitch({
         )}
         {actions && (
           <>
-            <Separator orientation="vertical" className="mx-12 data-[orientation=vertical]:h-6" />
+            <Separator orientation="vertical" className="mx-2 data-[orientation=vertical]:h-6" />
             {actions}
           </>
         )}
@@ -289,7 +290,7 @@ export function Pb1ReportSwitch({
             <AlertDialogDescription>{confirm?.text}</AlertDialogDescription>
           </AlertDialogHeader>
           <AlertDialogFooter>
-            <AlertDialogCancel disabled={busy}>Cancel</AlertDialogCancel>
+            <AlertDialogCancel disabled={busy}>Otkaži</AlertDialogCancel>
             <AlertDialogAction
               disabled={busy}
               onClick={(e) => {
@@ -346,7 +347,7 @@ export function Pb1CreateFinal({
     <Card className="items-center gap-5 px-6 py-10 text-center">
       <CopyPlus className="text-muted-foreground size-8" />
       <div className="grid max-w-md gap-1">
-        <h2 className="text-lg font-semibold">Final report</h2>
+        <h2 className="text-lg font-semibold">Konačni izveštaj</h2>
         <p className="text-muted-foreground text-sm">
           Konačni izveštaj još nije napravljen. Pravi se od preliminarnog kada je GFI gotov: svi iznosi se kopiraju, a
           posle se dva izveštaja menjaju i računaju posebno.
@@ -364,7 +365,7 @@ export function Pb1CreateFinal({
           {gfiDone ? (
             <Button variant="outline" size="sm" disabled={busy !== null} onClick={() => setConfirming("gfi-reopen")}>
               {busy === "gfi-reopen" ? <Loader2 className="animate-spin" /> : <Undo2 />}
-              Reopen GFI
+              Ponovo otvori GFI
             </Button>
           ) : (
             <Button
@@ -375,20 +376,20 @@ export function Pb1CreateFinal({
               onClick={() => setConfirming("gfi-done")}
             >
               {busy === "gfi-done" ? <Loader2 className="animate-spin" /> : <CheckCheck />}
-              Mark GFI as done
+              Označi GFI kao gotov
             </Button>
           )}
         </li>
         <li className="flex items-center justify-between gap-3 rounded-md border px-4 py-3">
           <div className="grid gap-0.5">
-            <span className="text-sm font-medium">2. Final report</span>
+            <span className="text-sm font-medium">2. Konačni izveštaj</span>
             <span className="text-muted-foreground text-xs">
               {gfiDone ? "Može da se napravi." : "Pravi se tek kada je GFI gotov."}
             </span>
           </div>
           <Button size="sm" disabled={!gfiDone || busy !== null} onClick={() => void run("final")}>
             {busy === "final" ? <Loader2 className="animate-spin" /> : <CopyPlus />}
-            Create from preliminary
+            Napravi iz preliminarnog
           </Button>
         </li>
       </ol>
@@ -405,7 +406,7 @@ export function Pb1CreateFinal({
             <AlertDialogDescription>{confirm?.text}</AlertDialogDescription>
           </AlertDialogHeader>
           <AlertDialogFooter>
-            <AlertDialogCancel disabled={busy !== null}>Cancel</AlertDialogCancel>
+            <AlertDialogCancel disabled={busy !== null}>Otkaži</AlertDialogCancel>
             <AlertDialogAction
               disabled={busy !== null}
               onClick={(e) => {

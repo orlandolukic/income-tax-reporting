@@ -34,18 +34,21 @@ export function HeaderSearch({
   placeholder,
   steps,
   emptyText,
+  leading,
 }: {
   value: string;
   onChange: (value: string) => void;
   placeholder: string;
   steps?: SearchSteps;
   emptyText?: string; // shown when the search finds nothing (Serbian)
+  leading?: ReactNode; // shown left of the field (Home: the company type filter)
 }) {
   const slot = useContext(SlotContext)?.slot;
   if (!slot) return null;
   const searching = value.trim() !== "";
   return createPortal(
     <div className="flex items-center gap-1.5">
+      {leading}
       <div className="relative w-44 sm:w-64">
         <Search className="text-muted-foreground pointer-events-none absolute top-1/2 left-2.5 size-4 -translate-y-1/2" />
         <Input
@@ -67,7 +70,7 @@ export function HeaderSearch({
         {searching && (
           <button
             type="button"
-            aria-label="Clear search"
+            aria-label="Obriši pretragu"
             onClick={() => onChange("")}
             className="text-muted-foreground hover:text-foreground absolute top-1/2 right-2 -translate-y-1/2 cursor-pointer"
           >
@@ -85,10 +88,10 @@ export function HeaderSearch({
           >
             {steps.total ? `${steps.current + 1} / ${steps.total}` : (emptyText ?? "0")}
           </span>
-          <Button variant="ghost" size="icon" className="size-8" aria-label="Previous match" disabled={!steps.total} onClick={steps.onPrevious}>
+          <Button variant="ghost" size="icon" className="size-8" aria-label="Prethodni pogodak" disabled={!steps.total} onClick={steps.onPrevious}>
             <ChevronUp />
           </Button>
-          <Button variant="ghost" size="icon" className="size-8" aria-label="Next match" disabled={!steps.total} onClick={steps.onNext}>
+          <Button variant="ghost" size="icon" className="size-8" aria-label="Sledeći pogodak" disabled={!steps.total} onClick={steps.onNext}>
             <ChevronDown />
           </Button>
         </>

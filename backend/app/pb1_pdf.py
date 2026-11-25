@@ -37,7 +37,7 @@ logger = get_logger(__name__)
 AMOUNT_DECIMALS = 2
 THOUSANDS, DECIMAL = ".", ","  # Serbian separators, as in the app
 LETTER = re.compile(r"[^\W\d_]")
-APP_NAME = "Income Tax Reporting"
+APP_NAME = "Izveštavanje o porezu na dobit"
 
 PDF_FONT_CANDIDATES = [
     ("C:/Windows/Fonts/segoeui.ttf", "C:/Windows/Fonts/segoeuib.ttf"),
@@ -63,6 +63,14 @@ RED = colors.HexColor("#dc2626")
 RED_SOFT = colors.HexColor("#fef2f2")
 RED_BORDER = colors.HexColor("#fecaca")
 GREEN = colors.HexColor("#16a34a")
+SUBTOTAL_BG = colors.HexColor("#dfe8fb")  # soft blue of the app mark: a section subtotal
+LOCKED_BG = colors.HexColor("#e6e6e9")  # a fixed, computed value: darker than the section rows' TINT
+
+
+def _locked(cell) -> bool:
+    """A field with a fixed, computed value (formula, not editable), shown grey (user, 2026-11-25);
+    not a section subtotal (own background) nor a head cell with a sheet fill."""
+    return bool(getattr(cell, "formula", False)) and not getattr(cell, "subtotal", False) and not getattr(cell, "fill", None)
 WHITE = colors.white
 
 PAGE = landscape(A4)
@@ -177,7 +185,10 @@ def _cell_para(cell, column, size: float, *, span: int = 1, bold: bool | None = 
     align = TA_RIGHT if align_end or number or (text.strip() and not LETTER.search(text)) else TA_LEFT
     if color is None:
         negative = number and _number(cell.value) and cell.value < 0
-        color = GREEN if getattr(cell, "green", False) else RED if red or negative or getattr(cell, "red", False) else (MUTED if column.narrow and span == 1 else TEXT)
+        if getattr(cell, "green", False):
+            color = GREEN  # an overrun of a line with "-" in the line 59 formula
+        else:
+            color = RED if red or negative or getattr(cell, "red", False) else (MUTED if column.narrow and span == 1 else TEXT)
     return Paragraph(escape(text), _style(size, cell.bold if bold is None else bold, align, color))
 
 
@@ -275,6 +286,8 @@ def _form_table(rows, columns, widths: list[float], size: float, *, index_key: s
         ("TOPPADDING", (0, 0), (-1, 0), 5), ("BOTTOMPADDING", (0, 0), (-1, 0), 5),
     ]
     keys = [c.key for c in columns]
+    subtotal_cells: list[tuple[int, int]] = []
+    locked: list[tuple[int, int]] = []
     current = keys.index(current_key) if current_key in keys else None
     if current is not None:
         commands.append(("BACKGROUND", (current, 0), (current, 0), ACCENT))
@@ -298,7 +311,14 @@ def _form_table(rows, columns, widths: list[float], size: float, *, index_key: s
                 index += 1
                 continue
             span = _span(row.cells, columns, index, _text(cell))
-            line.append(_cell_para(cell, column, size, span=span, bold=cell.bold or row.shaded))
+            if getattr(cell, "subtotal", False):
+                # A section subtotal: > 0 red, < 0 green (cell flags), bold, on its own soft background.
+                line.append(_cell_para(cell, column, size, span=span, bold=True))
+                subtotal_cells.append((index, r))
+            else:
+                line.append(_cell_para(cell, column, size, span=span, bold=cell.bold or row.shaded))
+                if _locked(cell):
+                    locked.append((index, r))
             if span > 1:
                 commands.append(("SPAN", (index, r), (index + span - 1, r)))
                 line += [""] * (span - 1)
@@ -314,6 +334,8 @@ def _form_table(rows, columns, widths: list[float], size: float, *, index_key: s
             ]
         elif current is not None:
             commands.append(("BACKGROUND", (current, r), (current, r), ACCENT_SOFT))
+    commands += [("BACKGROUND", cell, cell, SUBTOTAL_BG) for cell in subtotal_cells]
+    commands += [("BACKGROUND", cell, cell, LOCKED_BG) for cell in locked]
     table = Table(data, colWidths=widths, rowHeights=heights, repeatRows=1)
     table.setStyle(TableStyle(commands))
     table.hAlign = "LEFT"
@@ -328,24 +350,22 @@ def _widths(columns, total: float) -> list[float]:
 
 
 def _head_figures(table) -> list[tuple[str, str, bool]]:
-    """Labelled values of the head rows (Poreski bilans: months in business, Klasa 5, Klasa 6):
-    a text with a value to its right, or below it in the next head row. The title and the
-    company name (column B) are in the report's header already."""
-    columns = table.head_columns or table.columns
-    keys = [c.key for c in columns]
+    """The head's labelled values, as on the page (API head_figures: Klasa 5, Klasa 6, Saldo
+    (Klasa 6 - 5), Meseci poslovanja; user 2026-11-25). The title and the company name are in
+    the report's header already."""
+    cells = {(row.row, key): cell for row in table.head for key, cell in row.cells.items()}
     figures = []
-    for i, row in enumerate(table.head):
-        for j, key in enumerate(keys[2:], start=2):
-            cell = row.cells.get(key)
-            if cell is None or cell.amount or _number(cell.value) or not _text(cell):
-                continue
-            right = row.cells.get(keys[j + 1]) if j + 1 < len(keys) else None
-            below = table.head[i + 1].cells.get(key) if i + 1 < len(table.head) else None
-            for value in (right, below):
-                if value is not None and (value.amount or _number(value.value)):
-                    text = format_value(value.value, value.format, value.amount)[0]
-                    figures.append((_text(cell), text, _number(value.value) and value.value < 0))
-                    break
+    for figure in getattr(table, "head_figures", []):
+        value = cells.get((figure.row, figure.column))
+        if value is None:
+            continue
+        text = format_value(value.value, value.format, value.amount)[0]
+        tone = getattr(value, "tone", None)
+        # Klasa 5 red (expenses), Klasa 6 green (revenue), the Saldo by its sign; else red when negative.
+        negative = _number(value.value) and value.value < 0
+        positive = _number(value.value) and value.value > 0
+        color = RED if tone == "expense" else GREEN if tone == "income" or (tone == "balance" and positive) else negative
+        figures.append((figure.label, text, color))
     return figures
 
 
@@ -375,7 +395,9 @@ def _figure_strip(figures: list[tuple], width: float) -> Table:
     tiles = []
     for figure in figures:
         label, value, negative = figure[:3]
-        content = [[_para(label, 7.2, color=MUTED)], [_para(value, value_size, True, color=RED if negative else INK)]]
+        # The third item: True (negative: red), False, or a colour of its own.
+        color = negative if isinstance(negative, colors.Color) else RED if negative else INK
+        content = [[_para(label, 7.2, color=MUTED)], [_para(value, value_size, True, color=color)]]
         if len(figure) > 3 and figure[3]:
             # A result's status (Dobitak / Gubitak / Nula) and its note, under the value.
             content.append([_para(figure[3], 7.2, True, color=figure[4])])
@@ -418,6 +440,7 @@ def _card(title: str, groups: list[list], keys: list[str], columns: dict, width:
         ("LEFTPADDING", (0, 0), (-1, 0), 7), ("TOPPADDING", (0, 0), (-1, 0), 4.5),
         ("BOTTOMPADDING", (0, 0), (-1, 0), 4.5),
     ]
+    locked: list[tuple[int, int]] = []
     if header:
         data.append([_para(h, size - 0.8, True, TA_RIGHT if i != 1 else TA_LEFT, MUTED) for i, h in enumerate(header)])
         commands.append(("LINEBELOW", (0, 1), (-1, 1), 0.6, BORDER))
@@ -433,6 +456,8 @@ def _card(title: str, groups: list[list], keys: list[str], columns: dict, width:
                     continue
                 column = columns[key]
                 line.append(_cell_para(cell, column, size, bold=cell.bold or total))
+                if _locked(cell):
+                    locked.append((n, r))
             data.append(line)
             if total:
                 commands += [("BACKGROUND", (0, r), (-1, r), TINT), ("LINEBEFORE", (0, r), (0, r), 2.4, ACCENT)]
@@ -440,6 +465,7 @@ def _card(title: str, groups: list[list], keys: list[str], columns: dict, width:
                 commands.append(("LINEABOVE", (0, r), (-1, r), 1.1, RULE))
             elif r > (2 if header else 1):
                 commands.append(("LINEABOVE", (0, r), (-1, r), 0.35, BORDER))
+    commands += [("BACKGROUND", cell, cell, LOCKED_BG) for cell in locked]
     card = Table(data, colWidths=widths)
     card.setStyle(TableStyle(commands))
     return card
@@ -549,16 +575,17 @@ RESULT_STATUS = {"profit": ("Dobitak", GREEN), "loss": ("Gubitak", RED), "zero":
 
 
 def _result_figures(results) -> list[tuple]:
-    """The accounting and the tax result as tiles with their status (as on the page)."""
-    figures = []
-    for label, result, note in (
-        ("Knjigovodstveni rezultat", results.accounting, ""),
-        ("Poreski rezultat", results.tax, "Porez i mesečna akontacija su 0."),
-    ):
-        status, color = RESULT_STATUS[result.status]
-        if result.status == "loss" and note:
-            status = f"{status} · {note}"
-        figures.append((label, format_value(result.value, "#,##0.00", True)[0], result.value < 0, status, color))
+    """The accounting and the tax result as tiles (as on the page, user 2026-11-25): the
+    accounting result (the balance 6 - 5) with its status, green above 0, red below; the tax
+    result without status or colour (a loss only notes that tax and advance are 0)."""
+    accounting = results.accounting
+    status, color = RESULT_STATUS[accounting.status]
+    value_color = GREEN if accounting.value > 0 else RED if accounting.value < 0 else INK
+    figures = [("Knjigovodstveni rezultat (6 - 5)", format_value(accounting.value, "#,##0.00", True)[0],
+                value_color, status, color)]
+    tax = results.tax
+    note = "Porez i akontacija su 0." if tax.status == "loss" else ""
+    figures.append(("Poreski rezultat (poreska osnovica)", format_value(tax.value, "#,##0.00", True)[0], INK, note, MUTED))
     return figures
 
 
@@ -598,7 +625,7 @@ def _canvas_class(footer_left: str):
                 self.setFont(FONT, 7.5)
                 self.setFillColor(MUTED)
                 self.drawString(MARGIN_X, 7 * mm, footer_left)
-                self.drawRightString(width - MARGIN_X, 7 * mm, f"Page {self._pageNumber} of {total}")
+                self.drawRightString(width - MARGIN_X, 7 * mm, f"Strana {self._pageNumber} od {total}")
                 super().showPage()
             super().save()
 
@@ -608,7 +635,7 @@ def _canvas_class(footer_left: str):
 def build_pb1_pdf(tables: list, company: str, pib: str | None, year: int, report: str = "preliminary") -> bytes:
     """The PDF report of a company's PB-1 form; `tables`: the Pb1Table of each tab, in tab order;
     `report`: which of the company's two reports (preliminary, final) it is."""
-    kind = "Final" if report == "final" else "Preliminary"
+    kind = "Konačni" if report == "final" else "Preliminarni"
     _register_fonts()
     buffer = io.BytesIO()
     doc = SimpleDocTemplate(
@@ -622,7 +649,7 @@ def build_pb1_pdf(tables: list, company: str, pib: str | None, year: int, report
     # A submitted report says when (user, 2026-11-17).
     submitted_at = getattr(tables[0], "submitted_at", None) if tables else None
     submitted = (
-        f" &nbsp;·&nbsp; Submitted {submitted_at.astimezone().strftime('%d.%m.%Y. %H:%M')}" if submitted_at else ""
+        f" &nbsp;·&nbsp; Predato {submitted_at.astimezone().strftime('%d.%m.%Y. %H:%M')}" if submitted_at else ""
     )
 
     def decorate(c, _doc):
@@ -643,7 +670,7 @@ def build_pb1_pdf(tables: list, company: str, pib: str | None, year: int, report
         _para(company, 22, True, color=INK),
         Spacer(1, 1.5 * mm),
         Paragraph(
-            f"{kind} PB-1 report &nbsp;·&nbsp; {year} &nbsp;·&nbsp; PIB {escape(pib or '-')}{submitted}",
+            f"{kind} PB-1 izveštaj &nbsp;·&nbsp; {year} &nbsp;·&nbsp; PIB {escape(pib or '-')}{submitted}",
             _style(10, color=MUTED),
         ),
         Spacer(1, 5 * mm),
@@ -667,7 +694,9 @@ def build_pb1_pdf(tables: list, company: str, pib: str | None, year: int, report
         section = _summary_figures(table)
         if section and table.results is not None:
             # The closing rows with the accounting and tax result: one section, as on the page.
-            story += [_result_section(section + _result_figures(table.results), width), Spacer(1, 4 * mm)]
+            # As on the page (user, 2026-11-25): the accounting result, the tax result (= the tax
+            # base, not written a second time), then Porez 15% and Mesecna akontacija.
+            story += [_result_section(_result_figures(table.results) + section[1:], width), Spacer(1, 4 * mm)]
         elif section:
             story += [_figure_strip(section, width), Spacer(1, 4 * mm)]
         columns = table.columns  # the comment column is not one of them: comments are left out
@@ -681,5 +710,5 @@ def build_pb1_pdf(tables: list, company: str, pib: str | None, year: int, report
 
     generated = datetime.now().strftime("%d.%m.%Y. %H:%M")
     doc.build(story, onFirstPage=decorate, onLaterPages=decorate,
-              canvasmaker=_canvas_class(f"{APP_NAME} · {running} · Generated {generated}"))
+              canvasmaker=_canvas_class(f"{APP_NAME} · {running} · Napravljen {generated}"))
     return buffer.getvalue()
